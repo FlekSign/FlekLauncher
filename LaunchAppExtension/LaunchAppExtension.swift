@@ -16,7 +16,7 @@ private struct LaunchAppExtensionError: LocalizedError {
 
 struct LaunchAppExtension: AppIntent {
     static var title: LocalizedStringResource { "Launch App" }
-    static var description: IntentDescription { "This action directly launches an app in normal mode in LiveContainer. To get the launch URL, open LiveContainer, hold the app, tap \"Add to Home Screen\" -> \"Copy Launch URL\"" }
+    static var description: IntentDescription { "This action directly launches an app in normal mode in FlekDeck. To get the launch URL, open FlekDeck, hold the app, tap \"Add to Home Screen\" -> \"Copy Launch URL\"" }
     @Parameter(title: "Launch URL")
     var launchURL: URL
     
@@ -69,7 +69,7 @@ struct LaunchAppExtension: AppIntent {
                 LaunchAppExtension.ext = ext
             } catch {
                 NSLog("Failed to start extension \(error)")
-                throw LaunchAppExtensionError("Failed to start extension \(error). To use the Launch App shortcut, reinstall LiveContainer with LaunchAppExtension and ShareExtension installed. If you use SideStore, choose \"Keep App Extensions (Use Main Profile)\". If you use Impactor, choose \"Only Register Main Bundle\". For other sideloaders, select keep all extensions, i.e. DO NOT Remove any extension.")
+                throw LaunchAppExtensionError("Failed to start extension \(error). To use the Launch App shortcut, reinstall FlekDeck with LaunchAppExtension and ShareExtension installed. If you use SideStore, choose \"Keep App Extensions (Use Main Profile)\". If you use Impactor, choose \"Only Register Main Bundle\". For other sideloaders, select keep all extensions, i.e. DO NOT Remove any extension.")
             }
             
         }
@@ -81,26 +81,26 @@ struct LaunchAppExtension: AppIntent {
     func perform() async throws -> some IntentResult {
         // sanitize url
         let normalizedLaunchScheme = launchURL.scheme?.lowercased()
-        var isLiveContainerURL = normalizedLaunchScheme == "livecontainer"
-        let preferredScheme = isLiveContainerURL ? nil : (normalizedLaunchScheme == "livecontainer1" ? "livecontainer" : normalizedLaunchScheme)
+        var isLiveContainerURL = normalizedLaunchScheme == "flekdeck"
+        let preferredScheme = isLiveContainerURL ? nil : (normalizedLaunchScheme == "flekdeck1" ? "flekdeck" : normalizedLaunchScheme)
         
         if let preferredScheme, let schemes = LCSharedUtils.lcUnorderedUrlSchemes() {
             isLiveContainerURL = schemes.contains(preferredScheme)
         }
         
         if !isLiveContainerURL && normalizedLaunchScheme != "sidestore" {
-            throw LaunchAppExtensionError("Not a livecontainer URL!")
+            throw LaunchAppExtensionError("Not a FlekDeck URL!")
         }
         
         guard
             let appGroupId = LCSharedUtils.appGroupID(),
             let lcSharedDefaults = UserDefaults(suiteName: appGroupId)
         else {
-            throw LaunchAppExtensionError("lcSharedDefaults failed to initialize, because no app group was found. Did you sign LiveContainer correctly?")
+            throw LaunchAppExtensionError("lcSharedDefaults failed to initialize, because no app group was found. Did you sign FlekDeck correctly?")
         }
         
         if normalizedLaunchScheme == "sidestore" {
-            lcSharedDefaults.set("livecontainer", forKey: "LCLaunchExtensionScheme")
+            lcSharedDefaults.set("flekdeck", forKey: "LCLaunchExtensionScheme")
             lcSharedDefaults.set("builtinSideStore", forKey: "LCLaunchExtensionBundleID")
             lcSharedDefaults.set(Date.now, forKey: "LCLaunchExtensionLaunchDate")
             try await openURL(launchOptions: ["url": launchURL])
@@ -108,7 +108,7 @@ struct LaunchAppExtension: AppIntent {
         }
         
         if launchURL.host != "livecontainer-launch" {
-            throw LaunchAppExtensionError("Not a livecontainer launch URL!")
+            throw LaunchAppExtensionError("Not a FlekDeck launch URL!")
         }
 
         var bundleId: String? = nil
@@ -200,8 +200,8 @@ struct LaunchAppExtension: AppIntent {
                 schemeToLaunch = firstFreeInstalledLC(preferredScheme: preferredScheme)
                 allowClassicMode = schemeToLaunch != nil
             } else {
-                schemeToLaunch = "livecontainer"
-                allowClassicMode = !LCSharedUtils.isLCScheme(inUse: "livecontainer")
+                schemeToLaunch = "flekdeck"
+                allowClassicMode = !LCSharedUtils.isLCScheme(inUse: "flekdeck")
             }
         }
 

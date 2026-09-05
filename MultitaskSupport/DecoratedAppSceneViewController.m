@@ -10,14 +10,173 @@
 
 @interface DecoratedAppSceneViewController()
 @property(nonatomic) NSArray* activatedVerticalConstraints;
+@property(nonatomic) NSString* windowName;
 @property(nonatomic) NSString* dataUUID;
 @property(nonatomic) int pid;
 @property(nonatomic) CGRect originalFrame;
 @property(nonatomic) UIBarButtonItem *maximizeButton;
 @property(nonatomic) bool isAppTerminationRequested;
+/// Whether the guest has already been reported as drawing its own content. The
+/// cue can arrive from more than one place, so the first one wins and the rest
+/// are ignored.
+@property(nonatomic) BOOL didReportContentArrived;
+- (void)applySceneFrameToSettings:(UIMutableApplicationSceneSettings *)settings orientation:(UIInterfaceOrientation)orientation;
+- (void)applyMaximizedLayout;
+- (void)applyMaximizedGeometryToSettings:(UIMutableApplicationSceneSettings *)settings;
 @end
 
-@implementation DecoratedAppSceneViewController
+/// How long after its scene is presented the window keeps the launch screen it
+/// opened with. The guest is drawing by then — a launch screen of its own if it
+/// is still starting up — so what replaces ours is, for most apps, the same
+/// picture. Long enough for that first frame to land, short enough that a guest
+/// whose picture differs is not sat behind ours.
+static const NSTimeInterval kContentGraceAfterScene = 0.45;
+
+/// The last word, for a guest whose scene never gets presented at all — one that
+/// dies on the way up. Nothing may leave a stand-in covering a window for good.
+static const NSTimeInterval kContentArrivalLimit = 4.0;
+
+/// Quarter-turns clockwise from upright, in the same sense the dock manager
+/// counts them.
+static NSInteger LCInterfaceSteps(UIInterfaceOrientation orientation) {
+    switch(orientation) {
+        case UIInterfaceOrientationLandscapeLeft:      return 1;
+        case UIInterfaceOrientationPortraitUpsideDown: return 2;
+        case UIInterfaceOrientationLandscapeRight:     return 3;
+        default:                                       return 0;
+    }
+}
+
+static NSInteger LCDeviceSteps(UIDeviceOrientation orientation) {
+    switch(orientation) {
+        case UIDeviceOrientationLandscapeRight:        return 1;
+        case UIDeviceOrientationPortraitUpsideDown:    return 2;
+        case UIDeviceOrientationLandscapeLeft:         return 3;
+        default:                                       return 0;
+    }
+}
+
+/// Rolls a set of insets `steps` quarter-turns clockwise: what sat along the left
+/// edge ends up along the top, and so on round.
+static UIEdgeInsets LCInsetsRotated(UIEdgeInsets insets, NSInteger steps) {
+    for(NSInteger i = 0; i < ((steps % 4) + 4) % 4; i++) {
+        insets = UIEdgeInsetsMake(insets.left, insets.bottom, insets.right, insets.top);
+    }
+    return insets;
+}
+
+/// The orientation the guest's scene is actually in, which is not always the
+/// host's. A landscape-only guest runs sideways inside a portrait host — its
+/// scene carries its own orientation, and every piece of geometry we hand it
+/// (its frame, and the insets it is told to keep clear) is expressed in that
+/// orientation, not in ours. Asking `statusBarOrientation` describes the bar
+/// and the launcher, not the app being laid out.
+///
+/// Falls back to the host's while a scene is still coming up and has yet to say
+/// which way it is facing.
+static UIInterfaceOrientation LCGuestSceneOrientation(UIMutableApplicationSceneSettings *settings) {
+    UIInterfaceOrientation orientation = settings.interfaceOrientation;
+    if(orientation == UIInterfaceOrientationUnknown) {
+        return UIApplication.sharedApplication.statusBarOrientation;
+    }
+    return orientation;
+}
+
+/// The last device orientation that could describe how the guest is being *read*.
+///
+/// `UIDevice.currentDevice.orientation` also reports face-up and face-down, which
+/// a phone tilted far enough back onto its own back will hit. Neither is an
+/// answer to "which way round is the user holding this" — they describe the
+/// phone's relationship to the ground, not to the viewer.
+///
+/// That distinction is load-bearing here because the device is consulted at
+/// exactly the moment the scene's own reported orientation has been found
+/// untrustworthy. Letting face-up fall through to the guess below swaps one
+/// unreliable answer for a different one: a phone read as `landscapeRight`
+/// resolves the guest to `landscapeLeft` while it is being held, and to
+/// `landscapeRight` the instant it is tilted past face-up — flipping the guest
+/// 180° for no reason the user caused, and only in multitask, since nothing else
+/// derives an orientation this way.
+///
+/// Holding the last real answer makes tilt mean nothing, which is what iOS does
+/// natively: an app laid flat on a table keeps the orientation it had.
+/// Whether guest geometry may currently be re-derived.
+///
+/// Delegates to `LCRotationLock`, which answers no both while the phone is lying
+/// flat — where the device is not saying which way the screen is being read, so
+/// anything derived from it is a guess — and while the on-screen panel is holding
+/// the lock by hand. Both routes go through this one predicate on purpose: a
+/// manual lock that took a different path through the geometry code would be a
+/// second thing to get right.
+static BOOL LCRotationIsLocked(void) {
+    return LCRotationLock.isLocked;
+}
+
+static UIDeviceOrientation LCLastViewingDeviceOrientation(void) {
+    static UIDeviceOrientation last = UIDeviceOrientationPortrait;
+    UIDeviceOrientation current = UIDevice.currentDevice.orientation;
+    if(UIDeviceOrientationIsValidInterfaceOrientation(current)) {
+        last = current;
+    }
+    return last;
+}
+
+/// How far the guest has turned its own content against the scene it lives in.
+///
+/// A guest autorotates on `deviceOrientation`. When this host is pinned upright
+/// the scene never follows, so the guest is turned inside a window that is not —
+/// and anything expressed in the guest's own frame is carried around with it.
+static NSInteger LCGuestSelfRotationSteps(UIMutableApplicationSceneSettings *settings) {
+    // Sticky reading, like every other orientation consumer in this file: face-up
+    // would otherwise report zero steps and describe a turned guest as upright.
+    UIDeviceOrientation device = LCLastViewingDeviceOrientation();
+    if(!UIDeviceOrientationIsValidInterfaceOrientation(device)) return 0;
+    NSInteger steps = LCDeviceSteps(device) - LCInterfaceSteps(LCGuestSceneOrientation(settings));
+    return ((steps % 4) + 4) % 4;
+}
+
+/// The orientation the guest's window is actually in.
+///
+/// `settings.interfaceOrientation` — and `statusBarOrientation` behind it — can
+/// say portrait while the window it describes is 874x402. Every piece of geometry
+/// here is derived from that answer: which way the scene frame is measured, which
+/// edge of the screen the island is on, which insets the guest is handed. Derived
+/// from a stale one, all of it lands crosswise, which is what leaves a strip of
+/// the host's backdrop beside a turned guest.
+///
+/// The window's own shape cannot be stale — it is the rectangle the content is
+/// being drawn into, and its safe area agrees with it. So when the two disagree
+/// the window wins, and the device says which of the two landscape directions it
+/// is. Device and interface landscape names are mirror images; see
+/// `restoreOrientationAfterSwitcher`.
+static UIInterfaceOrientation LCWindowOrientation(UIView *view, UIMutableApplicationSceneSettings *settings) {
+    UIInterfaceOrientation reported = LCGuestSceneOrientation(settings);
+    CGSize size = view.window.bounds.size;
+    if(size.width <= 0 || size.height <= 0) return reported;
+
+    BOOL windowIsLandscape = size.width > size.height;
+    if(windowIsLandscape == UIInterfaceOrientationIsLandscape(reported)) return reported;
+
+    switch(LCLastViewingDeviceOrientation()) {
+        case UIDeviceOrientationLandscapeLeft:      return UIInterfaceOrientationLandscapeRight;
+        case UIDeviceOrientationLandscapeRight:     return UIInterfaceOrientationLandscapeLeft;
+        case UIDeviceOrientationPortraitUpsideDown: return UIInterfaceOrientationPortraitUpsideDown;
+        default: break;
+    }
+    return windowIsLandscape ? UIInterfaceOrientationLandscapeRight : UIInterfaceOrientationPortrait;
+}
+
+@implementation DecoratedAppSceneViewController {
+    /// The last orientation this guest was known to be in while the phone was
+    /// actually being held. The hard lock's memory.
+    ///
+    /// Held here rather than read back out of the scene settings on purpose: the
+    /// settings object is copied, merged and overwritten by several writers on
+    /// every host diff, and every previous attempt at this bug failed because it
+    /// trusted that object to still hold the guest's orientation when it came to
+    /// be read. An ivar cannot be clobbered by a settings merge.
+    UIInterfaceOrientation _lockedGuestOrientation;
+}
 - (instancetype)initWindowName:(NSString*)windowName bundleId:(NSString*)bundleId dataUUID:(NSString*)dataUUID rootVC:(UIViewController*)rootVC {
     self = [super initWithNibName:nil bundle:nil];
     self.view = [[UIStackView alloc] initWithFrame:self.view.frame];
@@ -26,71 +185,32 @@
     
     _dataUUID = dataUUID;
     _scaleRatio = 1.0;
-    _isMaximized = [NSUserDefaults.lcUserDefaults boolForKey:@"LCLaunchMultitaskMaximized"];
+    _isMaximized = YES;
+    [rootVC addChildViewController:self];
+    [MultitaskDockManager.shared.windowHostingView addSubview:self.view];
     _appSceneVC = [[AppSceneViewController alloc] initWithBundleId:bundleId dataUUID:dataUUID delegate:self];
     self.title = windowName;
     [self setupDecoratedView];
     
     [MultitaskDockManager.shared addRunningApp:windowName appUUID:dataUUID view:self.view];
-    
-    NSArray *menuItems = @[
-        [UIAction actionWithTitle:@"lc.multitask.copyPid".loc image:[UIImage systemImageNamed:@"doc.on.doc"] identifier:nil handler:^(UIAction * _Nonnull action) {
-            UIPasteboard.generalPasteboard.string = @(self.appSceneVC.pid).stringValue;
-        }],
-        [UIAction actionWithTitle:@"lc.multitask.enablePip".loc image:[UIImage systemImageNamed:@"pip.enter"] identifier:nil handler:^(UIAction * _Nonnull action) {
-            if ([PiPManager.shared isPiPWithVC:self.appSceneVC]) {
-                [PiPManager.shared stopPiP];
-            } else {
-                [PiPManager.shared startPiPWithVC:self.appSceneVC];
-            }
-        }],
-        [UICustomViewMenuElement elementWithViewProvider:^UIView *(UICustomViewMenuElement *element) {
-            return [self scaleSliderViewWithTitle:@"lc.multitask.scale".loc min:0.5 max:2.0 value:self.scaleRatio stepInterval:0.01];
-        }]
-    ];
-    
 
-    __weak typeof(self) weakSelf = self;
-    [self.navigationItem setTitleMenuProvider:^UIMenu *(NSArray<UIMenuElement *> *suggestedActions){
-        if(!weakSelf.appSceneVC.isAppRunning) {
-            return [UIMenu menuWithTitle:NSLocalizedString(@"lc.multitaskAppWindow.appTerminated", nil) children:@[]];
-        } else {
-            NSString *pidText = [NSString stringWithFormat:@"PID: %d", weakSelf.pid];
-            return [UIMenu menuWithTitle:pidText children:menuItems];
-        }
-    }];
-    
-    UIImage *minimizeImage = [UIImage systemImageNamed:@"minus.circle"];
-    UIImageConfiguration *minimizeConfig = [UIImageSymbolConfiguration configurationWithPointSize:16.0 weight:UIImageSymbolWeightMedium];
-    minimizeImage = [minimizeImage imageWithConfiguration:minimizeConfig];
-    UIBarButtonItem *minimizeButton = [[UIBarButtonItem alloc] initWithImage:minimizeImage style:UIBarButtonItemStylePlain target:self action:@selector(minimizeWindow)];
-    minimizeButton.tintColor = [UIColor systemYellowColor];
-    
-    NSString *maximizeImageName = _isMaximized ? @"arrow.down.right.and.arrow.up.left.circle" : @"arrow.up.left.and.arrow.down.right.circle";
-    UIImage *maximizeImage = [UIImage systemImageNamed:maximizeImageName];
-    UIImageConfiguration *maximizeConfig = [UIImageSymbolConfiguration configurationWithPointSize:16.0 weight:UIImageSymbolWeightMedium];
-    maximizeImage = [maximizeImage imageWithConfiguration:maximizeConfig];
-    self.maximizeButton = [[UIBarButtonItem alloc] initWithImage:maximizeImage style:UIBarButtonItemStylePlain target:self action:@selector(maximizeWindow)];
-    self.maximizeButton.tintColor = [UIColor systemGreenColor];
-    
-    UIImage *closeImage = [UIImage systemImageNamed:@"xmark.circle"];
-    UIImageConfiguration *closeConfig = [UIImageSymbolConfiguration configurationWithPointSize:16.0 weight:UIImageSymbolWeightMedium];
-    closeImage = [closeImage imageWithConfiguration:closeConfig];
-    UIBarButtonItem *closeButton = [[UIBarButtonItem alloc] initWithImage:closeImage style:UIBarButtonItemStylePlain target:self action:@selector(closeWindow)];
-    closeButton.tintColor = [UIColor systemRedColor];
-    
-    NSArray *barButtonItems = @[closeButton, self.maximizeButton, minimizeButton];
-    if([NSUserDefaults.lcSharedDefaults boolForKey:@"LCMultitaskBottomWindowBar"]) {
-        // resize handle overlaps the close button, so put the buttons on the left
-        self.navigationItem.leftBarButtonItems = barButtonItems;
-    } else {
-        self.navigationItem.rightBarButtonItems = barButtonItems;
-    }
-
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        [self adjustNavigationBarButtonSpacingWithNegativeSpacing:-8.0 rightMargin:-4.0];
+    // The window opens immediately, carrying the app's launch screen, and drops
+    // it once the guest is drawing its own. This is the last resort for a guest
+    // that never gets that far.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kContentArrivalLimit * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [self reportContentArrived];
     });
 
+
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(switcherBarVisibilityChanged)
+                                                 name:@"MultitaskBarVisibilityChanged"
+                                               object:nil];
+    
+    self.dataUUID = dataUUID;
+    self.windowName = windowName;
+    self.navigationItem.title = windowName;
+    
     return self;
 }
 
@@ -102,6 +222,8 @@
     frame.origin = CGPointMake(rootViewCenter.x - frame.size.width / 2, rootViewCenter.y - frame.size.height / 2);
     
     if(_isMaximized) {
+        // Don't call updateMaximizedFrameWithSettings here — navBar not created yet.
+        // The frame will be set after updateVerticalConstraints below.
         CGRect maxFrame = UIEdgeInsetsInsetRect(self.view.window.frame, self.view.window.safeAreaInsets);
         // save origin as normalized coordinates
         frame.origin.x /= maxFrame.size.width;
@@ -118,8 +240,13 @@
     navigationBar.items = @[navigationItem];
     
     self.view.axis = UILayoutConstraintAxisVertical;
-    self.view.backgroundColor = UIColor.systemBackgroundColor;
-    self.view.layer.cornerRadius = 10;
+    // Backdrop behind the guest scene. Black rather than systemBackground: when
+    // the guest doesn't fill the container — commonly in landscape, where an app
+    // that renders at a different aspect (or hasn't caught up to a rotation yet)
+    // leaves strips on the sides — this is what shows through, and white strips
+    // read as broken. Black matches the letterboxing every other app does.
+    self.view.backgroundColor = UIColor.blackColor;
+    self.view.layer.cornerRadius = 0;
     self.view.layer.masksToBounds = YES;
 
     self.navigationBar = navigationBar;
@@ -143,22 +270,7 @@
     self.contentView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     [fixedPositionContentView addSubview:self.contentView];
     
-    UIPanGestureRecognizer *moveGesture = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(moveWindow:)];
-    moveGesture.minimumNumberOfTouches = 1;
-    moveGesture.maximumNumberOfTouches = 1;
-    [self.navigationBar addGestureRecognizer:moveGesture];
-
-    // Resize handle (idea stolen from Notes debugging window)
-    UIPanGestureRecognizer *resizeGesture = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(resizeWindow:)];
-    resizeGesture.minimumNumberOfTouches = 1;
-    resizeGesture.maximumNumberOfTouches = 1;
-    self.resizeHandle = [[ResizeHandleView alloc] initWithFrame:CGRectMake(self.view.frame.size.width - navBarHeight, self.view.frame.size.height - navBarHeight, navBarHeight, navBarHeight)];
-    self.resizeHandle.alpha = _isMaximized ? 0.0 : 1.0;
-    [self.resizeHandle addGestureRecognizer:resizeGesture];
-    [self.view addSubview:self.resizeHandle];
-    
-    self.view.layer.borderWidth = _isMaximized ? 0.0 : 1.0;
-    self.view.layer.borderColor = UIColor.secondarySystemBackgroundColor.CGColor;
+    self.view.layer.borderWidth = 0;
     
     [self addChildViewController:_appSceneVC];
     [self.view insertSubview:_appSceneVC.view atIndex:0];
@@ -170,16 +282,64 @@
         [_appSceneVC.view.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor]
     ]];
     
+    // Set the maximized frame now that navBar is created and hidden
+    if(_isMaximized) {
+        [self updateMaximizedFrameWithSettings:self.appSceneVC.settings];
+    }
     
-    NSUserDefaults *defaults = NSUserDefaults.lcSharedDefaults;
-
-    [defaults addObserver:self forKeyPath:@"LCMultitaskBottomWindowBar" options:NSKeyValueObservingOptionNew context:NULL];
     [self updateOriginalFrame];
 }
 
 
-// Stolen from UIKitester
+- (UIMenu *)customizeMenu {
+    __weak typeof(self) weakSelf = self;
+
+    UIAction *copyPid = [UIAction actionWithTitle:[NSString stringWithFormat:@"%@ %d", @"lc.multitask.copyPid".loc, self.appSceneVC.pid]
+                                            image:[UIImage systemImageNamed:@"doc.on.doc"]
+                                       identifier:nil
+                                          handler:^(UIAction *action) {
+        UIPasteboard.generalPasteboard.string = @(weakSelf.appSceneVC.pid).stringValue;
+    }];
+
+    // Asked through hasShared first, as the dock does. Constructing the PiP
+    // manager claims the audio session — playback, not mixable, and active —
+    // and this menu is built for a look at a card, long before PiP is anywhere
+    // near being chosen: whatever else was playing stopped the moment the menu
+    // opened. If there is no manager there is no PiP, and the answer is known.
+    BOOL isPiPActive = PiPManager.hasShared && [PiPManager.shared isPiPWithVC:self.appSceneVC];
+    UIAction *togglePiP = [UIAction actionWithTitle:isPiPActive ? @"lc.multitask.disablePip".loc : @"lc.multitask.enablePip".loc
+                                              image:[UIImage systemImageNamed:isPiPActive ? @"pip.exit" : @"pip.enter"]
+                                         identifier:nil
+                                            handler:^(UIAction *action) {
+        if(PiPManager.hasShared && [PiPManager.shared isPiPWithVC:weakSelf.appSceneVC]) {
+            [PiPManager.shared stopPiP];
+        } else {
+            [PiPManager.shared startPiPWithVC:weakSelf.appSceneVC];
+        }
+    }];
+
+    // A real slider living inside a real menu — the reason this menu is built in
+    // UIKit rather than as a SwiftUI `Menu`, which takes actions and submenus only.
+    UICustomViewMenuElement *scaleSlider = [UICustomViewMenuElement elementWithViewProvider:^UIView *(UICustomViewMenuElement *element) {
+        return [weakSelf scaleSliderViewWithTitle:@"lc.multitask.scale".loc
+                                              min:0.5
+                                              max:2.0
+                                            value:weakSelf.scaleRatio
+                                     stepInterval:0.01];
+    }];
+
+    return [UIMenu menuWithTitle:@"" children:@[copyPid, togglePiP, scaleSlider]];
+}
+
 - (UIView *)scaleSliderViewWithTitle:(NSString *)title min:(CGFloat)minValue max:(CGFloat)maxValue value:(CGFloat)initialValue stepInterval:(CGFloat)step {
+    __weak typeof(self) weakSelf = self;
+    return [DecoratedAppSceneViewController scaleSliderViewWithTitle:title min:minValue max:maxValue value:initialValue stepInterval:step onChange:^(CGFloat newValue) {
+        [weakSelf applyScaleRatio:newValue];
+    }];
+}
+
+// Stolen from UIKitester
++ (UIView *)scaleSliderViewWithTitle:(NSString *)title min:(CGFloat)minValue max:(CGFloat)maxValue value:(CGFloat)initialValue stepInterval:(CGFloat)step onChange:(void (^)(CGFloat newValue))onChange {
     UIView *containerView = [[UIView alloc] init];
     containerView.translatesAutoresizingMaskIntoConstraints = NO;
     containerView.exclusiveTouch = YES;
@@ -214,13 +374,21 @@
     
     [stackView addArrangedSubview:slider];
     
-    [slider addTarget:self action:@selector(scaleSliderChanged:) forControlEvents:UIControlEventValueChanged];
-    
+    // UIAction rather than target/action: this builder is a class method, so there's
+    // no instance to act as the target — the caller supplies the behaviour instead.
+    [slider addAction:[UIAction actionWithHandler:^(UIAction *action) {
+        onChange(((UISlider *)action.sender).value);
+    }] forControlEvents:UIControlEventValueChanged];
+
     return containerView;
 }
 
 - (void)scaleSliderChanged:(_UIPrototypingMenuSlider *)slider {
-    self.scaleRatio = slider.value;
+    [self applyScaleRatio:slider.value];
+}
+
+- (void)applyScaleRatio:(CGFloat)newValue {
+    self.scaleRatio = newValue;
     self.appSceneVC.scaleRatio = _scaleRatio;
     if(self.appSceneVC.usesHostingControllerAPI) {
         self.appSceneVC.contentView.transform = CGAffineTransformMakeScale(_scaleRatio, _scaleRatio);
@@ -241,102 +409,111 @@
 
 - (void)closeWindow {
     _isAppTerminationRequested = true;
-    if([_appSceneVC isAppRunning]) {
+    if([_appSceneVC isAppRunning] || !_appSceneVC.isAppTerminationCleanUpCalled) {
+        // -terminate covers both a running guest and one that never started —
+        // the second happens when the window is closed while the app's files are
+        // still being staged, and going through the teardown is what releases
+        // them. Either way the teardown calls us back to close the window.
         [_appSceneVC terminate];
     } else {
+        // The app already exited on its own and the teardown has run, so nothing
+        // will call back; close the window directly.
         [self appSceneVCAppDidExit:self.appSceneVC];
     }
 }
 
 - (void)minimizeWindow {
     if (self.view.hidden) return;
+    // Reduce Motion: the window gives way where it stands instead of collapsing
+    // to a tenth of its size. The counterpart of the fade it comes back with, so
+    // a guest window leaves the way it arrives.
+    BOOL reduceMotion = UIAccessibilityIsReduceMotionEnabled();
     [UIView animateWithDuration:0.3 delay:0 options:UIViewAnimationOptionCurveEaseInOut animations:^{
         self.view.alpha = 0;
-        self.view.transform = CGAffineTransformMakeScale(0.1, 0.1);
+        if (!reduceMotion) {
+            self.view.transform = CGAffineTransformMakeScale(0.1, 0.1);
+        }
     } completion:^(BOOL finished) {
         if (!finished) return;
-        self.view.hidden = YES;
-        self.view.transform = CGAffineTransformIdentity;
-        [self.view.superview sendSubviewToBack:self.view];
+        [self finishMinimizeWindow];
     }];
 }
 
+/// Reports, once, that the guest is drawing its own content — the cue to drop the
+/// launch screen the window opened with.
+- (void)reportContentArrived {
+    if (self.didReportContentArrived) return;
+    self.didReportContentArrived = YES;
+    // Posted rather than called, the way the bar's visibility travels the other
+    // way between these two files — the dock is Swift and this is not, and a
+    // notification needs neither side's generated header.
+    [NSNotificationCenter.defaultCenter postNotificationName:@"LCWindowContentDidArrive" object:self.view];
+}
+
+- (void)finishMinimizeWindow {
+    self.view.hidden = YES;
+    self.view.transform = CGAffineTransformIdentity;
+    [self.view.superview sendSubviewToBack:self.view];
+}
+
 - (void)minimizeWindowPiP {
+    // Told to the dock the way `minimizeWindow`'s callers tell it: a window is
+    // leaving the stage, and what the dock shows next depends on what that
+    // leaves behind. Before the fade rather than after it, so the bar goes down
+    // with the window as it does on the way home — the dock reads visibility
+    // from the alpha, which the animation block sets at once.
+    [MultitaskDockManager.shared windowDidEnterPiP:self.dataUUID];
     [UIView animateWithDuration:0.3 delay:0 options:UIViewAnimationOptionCurveEaseInOut animations:^{
         self.view.alpha = 0;
     } completion:^(BOOL finished) {
+        // Cut short means brought back mid-fade — PiP stopped within a third of
+        // a second of starting — and hiding the window now would undo that.
+        if (!finished) return;
         self.view.hidden = YES;
     }];
 }
 
 - (void)unminimizeWindowPiP {
+    [self unminimizeWindowPiPWithCompletion:nil];
+}
+
+- (void)unminimizeWindowPiPWithCompletion:(void (^)(void))completion {
     [UIView animateWithDuration:0.3 delay:0 options:UIViewAnimationOptionCurveEaseInOut animations:^{
         self.view.hidden = NO;
         self.view.alpha = 1;
-    } completion:nil];
+    } completion:^(BOOL finished) {
+        // Whether or not the fade ran its course: AVKit is waiting on this
+        // before it finishes taking the PiP window down.
+        if (completion) completion();
+    }];
+    // The other half of the note in `minimizeWindowPiP`. After the values above
+    // are set, which the animation block does at once, so the dock finds a
+    // window on stage when it looks.
+    [MultitaskDockManager.shared windowDidExitPiP:self.dataUUID];
 }
 
 - (void)maximizeWindow {
-    void (^updateSettingsBlock)(UIMutableApplicationSceneSettings *settings);
-    
-    [self.view layoutIfNeeded];
-    if (self.isMaximized) {
-        updateSettingsBlock = ^(UIMutableApplicationSceneSettings *settings) {
-            [self updateWindowedFrameWithSettings:settings];
-        };
-        CGRect maxFrame = UIEdgeInsetsInsetRect(self.view.window.frame, self.view.window.safeAreaInsets);
-        CGRect newFrame = CGRectMake(self.originalFrame.origin.x * maxFrame.size.width, self.originalFrame.origin.y * maxFrame.size.height, self.originalFrame.size.width, self.originalFrame.size.height);
-        [UIView animateWithDuration:0.3 delay:0 options:UIViewAnimationOptionCurveEaseInOut animations:^{
-            self.view.frame = newFrame;
-            self.view.layer.borderWidth = 1;
-            self.resizeHandle.alpha = 1;
-            
-            [self.appSceneVC updateSettingsWithBlock:updateSettingsBlock];
-            
-            [self.view layoutIfNeeded];
-        } completion:^(BOOL finished) {
-            self.isMaximized = NO;
-            UIImage *maximizeImage = [UIImage systemImageNamed:@"arrow.up.left.and.arrow.down.right.circle"];
-            UIImageConfiguration *maximizeConfig = [UIImageSymbolConfiguration configurationWithPointSize:16.0 weight:UIImageSymbolWeightMedium];
-            self.maximizeButton.image = [maximizeImage imageWithConfiguration:maximizeConfig];
-        }];
-    } else {
-        updateSettingsBlock = ^(UIMutableApplicationSceneSettings *settings) {
-            [self updateMaximizedFrameWithSettings:settings];
-        };
-        [self updateOriginalFrame];
-        [UIView animateWithDuration:0.3 delay:0 options:UIViewAnimationOptionCurveEaseInOut animations:^{
-            self.isMaximized = YES;
-            [self updateVerticalConstraints];
-            
-            self.view.layer.borderWidth = 0;
-            self.resizeHandle.alpha = 0;
-            
-            [self.appSceneVC updateSettingsWithBlock:updateSettingsBlock];
-            
-            [self.view layoutIfNeeded];
-        } completion:^(BOOL finished) {
-            UIImage *restoreImage = [UIImage systemImageNamed:@"arrow.down.right.and.arrow.up.left.circle"];
-            UIImageConfiguration *restoreConfig = [UIImageSymbolConfiguration configurationWithPointSize:16.0 weight:UIImageSymbolWeightMedium];
-            self.maximizeButton.image = [restoreImage imageWithConfiguration:restoreConfig];
-        }];
-    }
+    // Windows are always maximized in chromeless mode — no-op
+    return;
 }
 
 - (void)appSceneVCAppDidExit:(AppSceneViewController*)vc {
-    BOOL skipTerminationScreen = [NSUserDefaults.lcSharedDefaults boolForKey:@"LCSkipTerminatedScreen"];
+    BOOL skipTerminationScreen = MultitaskRelaunchManager.skipsTerminatedScreen;
     BOOL isManual = _isAppTerminationRequested;
     if(isManual || skipTerminationScreen) {
         
         MultitaskDockManager *dock = [MultitaskDockManager shared];
         [dock removeRunningApp:self.dataUUID];
         
-        self.view.layer.masksToBounds = NO;
-        [UIView transitionWithView:self.view duration:0.4 options:UIViewAnimationOptionTransitionCurlUp animations:^{
-            self.view.hidden = YES;
-        } completion:^(BOOL b){
-            [self.view removeFromSuperview];
-        }];
+        // Gone without a send-off. Whatever closed this window has already drawn
+        // the exit — the card swiped away, the sweep of Close All, the flight into
+        // an icon — and this is only the teardown catching up afterwards. A page
+        // curl here used to go unseen behind the switcher's backdrop; now that
+        // Close All fades that backdrop while the windows are still tearing down,
+        // it plays out in the open, several windows curling away one after another
+        // once the cards have already gone.
+        self.view.hidden = YES;
+        [self.view removeFromSuperview];
         
         if(skipTerminationScreen) {
             [MultitaskRelaunchManager scheduleRelaunchIfNeededWithBundleId:self.appSceneVC.bundleId dataUUID:self.dataUUID isManualTermination:isManual];
@@ -350,11 +527,24 @@
         label.textAlignment = NSTextAlignmentCenter;
         [self.view insertSubview:label atIndex:0];
     }
+
+    // A guest that was floating leaves its PiP window behind, showing a scene
+    // nobody draws into any more, until the user finds the window's buttons.
+    // It goes with the guest. Last, once the window has been dealt with above:
+    // stopping brings the window back through the same path the restore button
+    // uses, and that path has to find a window already closed, or one showing
+    // the notice — not one on its way out.
+    if(PiPManager.hasShared && [PiPManager.shared isPiPWithVC:vc]) {
+        [PiPManager.shared stopPiP];
+    }
 }
 
 - (void)appSceneVC:(AppSceneViewController*)vc didInitializeWithError:(NSError *)error {
     dispatch_async(dispatch_get_main_queue(), ^{
         if(error) {
+            // Nothing is coming, so take the launch screen down rather than leave
+            // it standing in for an app that failed to start.
+            [self reportContentArrived];
             [vc appTerminationCleanUp];
             UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"lc.common.error".loc message:error.localizedDescription preferredStyle:UIAlertControllerStyleAlert];
             [alert addAction:[UIAlertAction actionWithTitle:@"lc.common.ok".loc style:UIAlertActionStyleCancel handler:nil]];
@@ -372,31 +562,132 @@
     });
 }
 
+- (void)appSceneVC:(AppSceneViewController*)vc willPresentSceneWithSettings:(UIMutableApplicationSceneSettings *)settings {
+    if(!_isMaximized) return;
+    // Re-derived rather than trusted: these settings were filled in when the
+    // window was built, and the switcher bar may have been laid out — and taken
+    // its strip — at any point since.
+    [self applyMaximizedGeometryToSettings:settings];
+}
+
+- (void)appSceneVCDidPresentScene:(AppSceneViewController*)vc {
+    // The guest's scene is on screen now and it is drawing into it. Give that
+    // first frame a moment to land, then let go of the launch screen this window
+    // opened with. This is the cue that fires for every guest; the settings
+    // update below is merely an earlier one when the guest happens to send it.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kContentGraceAfterScene * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [self reportContentArrived];
+    });
+}
+
 - (void)appSceneVCWillActivateScene:(AppSceneViewController *)vc {
     // Set up initial settings such as frame, safe area, etc
     [self appSceneVC:vc didUpdateFromSettings:vc.presenter.scene.settings.mutableCopy transitionContext:nil lifecycleActionType:0];
 }
 
 - (void)appSceneVC:(AppSceneViewController*)vc didUpdateFromSettings:(UIMutableApplicationSceneSettings *)baseSettings transitionContext:(id)newContext lifecycleActionType:(uint32_t)actionType {
-    [self.appSceneVC updateSettingsWithBlock:^(UIMutableApplicationSceneSettings *settings) {
-        settings.userInterfaceStyle = baseSettings.userInterfaceStyle;
-        settings.interfaceOrientation = baseSettings.interfaceOrientation;
-        settings.deviceOrientation = baseSettings.deviceOrientation;
-        settings.foreground = YES;
-        
+    UIMutableApplicationSceneSettings *newSettings = [vc.presenter.scene.settings mutableCopy];
+    newSettings.userInterfaceStyle = baseSettings.userInterfaceStyle;
+    // Only when the guest has not yet said which way it is facing.
+    //
+    // This is a diff of the *host's* settings, and the guest's orientation is not
+    // the host's. A landscape guest inside an upright host is the normal case here
+    // (see LCWindowOrientation above), so stamping the host's value over it is not
+    // a copy — it is a deletion. `vc.presenter.scene.settings.interfaceOrientation`
+    // is the only record anywhere in this process that the guest is turned, and
+    // this line is where it was being erased, on every host diff.
+    //
+    // What made that fatal is a few lines below: `updateMaximizedFrameWithSettings:`
+    // hands this same field to `LCWindowOrientation` as `reported`. Stamped
+    // portrait against an upright host window, the two agree, and that function
+    // returns at its early guard — so the sticky device reading it falls back on
+    // is never consulted. The guest is re-derived as upright.
+    //
+    // While the phone is genuinely held sideways this was survivable, because the
+    // guest's landscape was carried by `deviceOrientation` below, which the host
+    // kept re-asserting. At face-up that field stops carrying an answer (and the
+    // guard below correctly refuses to copy the non-answer), so the orientation
+    // has to be *remembered* rather than re-derived — and by then this line has
+    // already erased the memory. Portrait is all that is left. That is the snap.
+    if(newSettings.interfaceOrientation == UIInterfaceOrientationUnknown) {
+        newSettings.interfaceOrientation = baseSettings.interfaceOrientation;
+    }
+    // Face-up and face-down are not viewing orientations, and must not be copied.
+    //
+    // This is the authoritative writer of the guest's orientation: it pushes
+    // straight to the scene at the bottom of this method, so whatever it says
+    // overrules anything computed in AppSceneViewController. And it is driven by a
+    // host scene-settings *diff*, not by UIDeviceOrientationDidChangeNotification —
+    // which is why guarding that notification changed nothing.
+    //
+    // The host's own scene settings carry the raw SpringBoard reading, face-up
+    // included. Copying it verbatim tells the guest process "the device is now
+    // face-up", and the guest's UIKit — unhooked in multitask, since the guest
+    // hooks are gated on !isLiveProcess — resolves that non-answer to portrait and
+    // rotates itself. Nothing in the host moved, which is exactly why the host's
+    // own interfaceOrientation never changed while the guest visibly turned.
+    //
+    // Not assigning leaves the guest holding the orientation it already had, which
+    // is what a native app does when it is laid on a table.
+    if(UIDeviceOrientationIsValidInterfaceOrientation(baseSettings.deviceOrientation)) {
+        newSettings.deviceOrientation = baseSettings.deviceOrientation;
+    }
+    newSettings.foreground = YES;
+    
+    // HARD LOCK: same rule on the host-diff path — hold the shape while flat.
+    BOOL frozen = LCRotationIsLocked() && _lockedGuestOrientation != UIInterfaceOrientationUnknown;
+    if(!frozen) {
         if(self.isMaximized) {
-            [self updateMaximizedFrameWithSettings:settings];
+            [self updateMaximizedFrameWithSettings:newSettings];
         } else {
-            [self updateWindowedFrameWithSettings:settings];
+            [self updateWindowedFrameWithSettings:newSettings];
         }
-        CGRect newFrame = CGRectMake(0, 0, self.view.bounds.size.width, self.view.bounds.size.height - self.navigationBar.frame.size.height/self.scaleRatio);
-        
-        if(UIInterfaceOrientationIsLandscape(baseSettings.interfaceOrientation)) {
-            settings.frame = CGRectMake(0, 0, newFrame.size.height, newFrame.size.width);
-        } else {
-            settings.frame = CGRectMake(0, 0, newFrame.size.width, newFrame.size.height);
-        }
-    }];
+    }
+    // The orientation the guest was just told it is in — not the host's. When the
+    // two differ (a landscape guest inside an upright host) `updateMaximizedFrameWithSettings:`
+    // has already corrected `newSettings.interfaceOrientation` via `LCWindowOrientation`,
+    // and reaching past that for the host's value re-derives the drawable's
+    // width/height swap from the orientation the guest is *not* in.
+    if(!frozen) {
+        [self applySceneFrameToSettings:newSettings orientation:newSettings.interfaceOrientation];
+    }
+
+    [_appSceneVC.presenter.scene updateSettings:newSettings withTransitionContext:newContext completion:nil];
+
+    // An early cue when it comes, but only that: a settings update arrives when
+    // the guest changes something about its scene, and an app that changes
+    // nothing never sends one. `appSceneVCDidPresentScene:` is what this actually
+    // relies on.
+    [self reportContentArrived];
+}
+
+// Resizes the guest scene's drawable to match the current container view size.
+// Must be called whenever self.view.frame changes (rotation, bar show/hide),
+// otherwise apps that don't push their own settings update keep rendering at the
+// old size and leave a blank strip where the view grew.
+- (void)applySceneFrameToSettings:(UIMutableApplicationSceneSettings *)settings orientation:(UIInterfaceOrientation)orientation {
+    // Measured from bounds, never from frame. A window carries a transform while
+    // it is growing out of its icon, and `frame` is undefined under one — the
+    // guest's scene is presented during exactly that stretch, so reading the frame
+    // told it that it was icon-sized. It would lay out for that and stay wrong
+    // until something forced a fresh settings update, which is why toggling the
+    // bar appeared to repair it. Bounds is the size the window really occupies,
+    // transform or no transform.
+    CGSize windowSize = self.view.bounds.size;
+    // A hidden bar takes up none of the window, whatever its own frame still
+    // says. It is built at its full height and collapsed to nothing by a
+    // constraint, and a stack view does not lay out an arranged subview it is not
+    // showing — so early on, before anything has laid it out, the frame still
+    // reads its full height. Taking that off the guest's drawable leaves the
+    // picture short of the window it is drawn into, centred, with a strip of the
+    // black backdrop above and below it.
+    CGFloat barHeight = self.navigationBar.hidden ? 0 : self.navigationBar.frame.size.height;
+    CGRect newFrame = CGRectMake(0, 0, windowSize.width/self.scaleRatio, (windowSize.height - barHeight)/self.scaleRatio);
+    if(UIInterfaceOrientationIsLandscape(orientation)) {
+        settings.frame = CGRectMake(0, 0, newFrame.size.height, newFrame.size.width);
+    } else {
+        settings.frame = CGRectMake(0, 0, newFrame.size.width, newFrame.size.height);
+    }
 }
 
 - (void)adjustNavigationBarButtonSpacingWithNegativeSpacing:(CGFloat)spacing rightMargin:(CGFloat)margin {
@@ -432,31 +723,7 @@
 }
 
 
-- (void)observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object change:(NSDictionary *)change context:(void *)context {
-    [self.view layoutIfNeeded];
-    [UIView animateWithDuration:0.3 animations:^{
-        BOOL bottomWindowBar = [change[NSKeyValueChangeNewKey] boolValue];
-        if(bottomWindowBar) {
-            self.navigationItem.leftBarButtonItems = self.navigationItem.rightBarButtonItems;
-            self.navigationItem.rightBarButtonItems = nil;
-            [self.view addArrangedSubview:self.navigationBar];
-        } else {
-            self.navigationItem.rightBarButtonItems = self.navigationItem.leftBarButtonItems;
-            self.navigationItem.leftBarButtonItems = nil;
-            [self.view insertArrangedSubview:self.navigationBar atIndex:0];
-        }
-        
-        [self updateVerticalConstraints];
-        [self adjustNavigationBarButtonSpacingWithNegativeSpacing:-8.0 rightMargin:-4.0];
-        
-        if(_isMaximized) {
-            [self.appSceneVC updateSettingsWithBlock:^(UIMutableApplicationSceneSettings *settings) {
-                [self updateMaximizedFrameWithSettings:settings];
-            }];
-        }
-        [self.view layoutIfNeeded];
-    }];
-}
+
 
 - (void)moveWindow:(UIPanGestureRecognizer*)sender {
     if(_isMaximized) return;
@@ -488,47 +755,127 @@
 }
 
 - (void)updateVerticalConstraints {
-    [self.view layoutIfNeeded];
-    [UIView animateWithDuration:0.3 animations:^{
-        BOOL bottomWindowBar = [NSUserDefaults.lcSharedDefaults boolForKey:@"LCMultitaskBottomWindowBar"];
-        BOOL hideWindowBar = MultitaskDockManager.shared.isCollapsed && self.isMaximized;
-        CGFloat navBarHeight = hideWindowBar ? 0 : 44;
-        self.navigationBar.alpha = hideWindowBar ? 0 : 1;
-        self.navigationBar.hidden = hideWindowBar;
-        
-        // Update safe area insets
-        if(self.isMaximized) {
-            self.appSceneVC.shouldSkipDebounceOnce = YES;
-            __weak typeof(self) weakSelf = self;
-            [self.appSceneVC updateSettingsWithBlock:^(UIMutableApplicationSceneSettings *settings) {
-                [weakSelf updateMaximizedFrameWithSettings:settings];
-            }];
-        }
-        
-        [NSLayoutConstraint deactivateConstraints:self.activatedVerticalConstraints];
-        if(bottomWindowBar) {
-            self.activatedVerticalConstraints = @[
-                [self.appSceneVC.view.topAnchor constraintEqualToAnchor:self.view.topAnchor],
-                [self.appSceneVC.view.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor constant:-navBarHeight],
-                [self.navigationBar.heightAnchor constraintEqualToConstant:navBarHeight]
-            ];
-        } else {
-            self.activatedVerticalConstraints = @[
-                [self.appSceneVC.view.topAnchor constraintEqualToAnchor:self.view.topAnchor constant:navBarHeight],
-                [self.appSceneVC.view.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
-                [self.navigationBar.heightAnchor constraintEqualToConstant:navBarHeight]
-            ];
-        }
-        [NSLayoutConstraint activateConstraints:self.activatedVerticalConstraints];
+    // Update safe area insets
+    if(_isMaximized) {
+        __weak typeof(self) weakSelf = self;
+        self.appSceneVC.nextUpdateSettingsBlock = ^(UIMutableApplicationSceneSettings *settings) {
+            [weakSelf updateMaximizedFrameWithSettings:settings];
+        };
+    }
+    
+    self.navigationBar.hidden = YES;
+    
+    [NSLayoutConstraint deactivateConstraints:self.activatedVerticalConstraints];
+    self.activatedVerticalConstraints = @[
+        [self.appSceneVC.view.topAnchor constraintEqualToAnchor:self.view.topAnchor],
+        [self.appSceneVC.view.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
+        [self.navigationBar.heightAnchor constraintEqualToConstant:0]
+    ];
+    [NSLayoutConstraint activateConstraints:self.activatedVerticalConstraints];
+}
 
-        [self.view layoutIfNeeded];
+- (void)switcherBarVisibilityChanged {
+    [UIView animateWithDuration:0.3 animations:^{
+        [self applyMaximizedLayout];
     }];
+}
+
+- (void)refreshMaximizedLayout {
+    [self applyMaximizedLayout];
+}
+
+- (BOOL)awaitingFirstLayout {
+    return _lockedGuestOrientation == UIInterfaceOrientationUnknown;
+}
+
+/// Re-derives everything about a maximized window's geometry from the screen, the
+/// switcher bar and the orientation as they are now, and gets it to the guest.
+///
+/// Safe to call before the guest's scene exists, which is most of a window's
+/// opening. A window is built, framed and told the bar has arrived long before
+/// its guest has started, and pushing settings into a scene that is not there yet
+/// is a silent no-op — which is how a freshly opened app came up laid out for the
+/// screen the window was given at construction, from before the bar had been laid
+/// out and so had no strip to reserve. It drew underneath the bar until something
+/// later pushed settings of its own and put the frame right; toggling the bar was
+/// that something, which is why it looked like a repair. With no scene yet the
+/// same answer is written into the settings the scene will be created from, so
+/// the guest is laid out for the window it is really going into from its first
+/// frame.
+- (void)applyMaximizedLayout {
+    if(!_isMaximized) return;
+    FBScene *scene = self.appSceneVC.presenter.scene;
+    if(scene) {
+        [scene updateSettingsWithBlock:^(UIMutableApplicationSceneSettings *settings) {
+            [self applyMaximizedGeometryToSettings:settings];
+        }];
+    } else {
+        [self applyMaximizedGeometryToSettings:self.appSceneVC.settings];
+    }
+}
+
+/// The window's own frame and the insets the guest keeps clear, then the guest's
+/// drawable. In that order: the drawable is measured from the frame set above it,
+/// and resizing the window without resizing the picture inside it is what leaves
+/// the backdrop showing wherever the two disagree.
+- (void)applyMaximizedGeometryToSettings:(UIMutableApplicationSceneSettings *)settings {
+    // Everything below is measured from the screen this window is on, so there is
+    // nothing to derive while it is not on one. A closed window's controller
+    // outlives the view being taken out of the hierarchy, and answering that with
+    // zeroes would collapse it rather than leave it be.
+    if(!self.view.window) return;
+    // HARD LOCK: no geometry is re-derived while the phone is flat.
+    //
+    // Freezing the orientation alone was not enough, and the reason is that the
+    // guest does not need to be *told* it rotated in order to look rotated. It is
+    // handed a drawable of a given shape, and a responsive app given a 402x874
+    // drawable draws its portrait layout whatever its orientation says. So the
+    // shape is the thing that has to hold still, not the label on it.
+    //
+    // Gated on having a settled orientation so a guest opened while the phone is
+    // already flat still gets its initial layout; only re-derivation is blocked.
+    if(LCRotationIsLocked() && _lockedGuestOrientation != UIInterfaceOrientationUnknown) return;
+    [self updateMaximizedFrameWithSettings:settings];
+    [self applySceneFrameToSettings:settings orientation:LCGuestSceneOrientation(settings)];
 }
 
 - (UIEdgeInsets)updateMaximizedSafeAreaWithSettings:(UIMutableApplicationSceneSettings *)settings {
     BOOL bottomWindowBar = [NSUserDefaults.lcSharedDefaults boolForKey:@"LCMultitaskBottomWindowBar"];
     UIEdgeInsets safeAreaInsets = self.view.window.safeAreaInsets;
     if(self.navigationBar.hidden) {
+        // Whatever the bar already covers is not the guest's to keep clear a second
+        // time — but the edge it covers is not always the bottom. It is the viewer's
+        // right in landscape, which is the window's top or its bottom depending on
+        // which way the phone was turned, so the reservation comes off every edge
+        // rather than being assumed onto one. Portrait is unchanged by arithmetic:
+        // the reservation there is larger than the home-indicator inset it cancels.
+        // The window is held clear of the sensor housing while it is turned (see
+        // -updateMaximizedFrameWithSettings:), so the guest is no longer sitting
+        // under it and must not be told to keep it clear a second time.
+        //
+        // Asked of the window's own shape, not of how the device is being held.
+        // The two were the same answer while the window always turned with the
+        // phone, and the top inset was read from the device — a sticky reading,
+        // because the raw one turns face-up on a tilt and would put the inset back
+        // and shift the guest's content for it. Neither is right once the host can
+        // be pinned: an orientation-locked guest keeps a landscape window while the
+        // phone is turned upright, and the device reading then restored the top
+        // inset and laid a strip of the black backdrop across the top of a guest
+        // that had not moved. It fails the other way too — a portrait window under
+        // a sideways phone had its housing clearance taken away and drew under the
+        // island. The window's shape cannot be wrong about the window, and it is
+        // already what the long edges below are asked of, two lines apart.
+        CGSize windowSize = self.view.window.bounds.size;
+        if(windowSize.width > windowSize.height) {
+            safeAreaInsets.top = 0;
+            safeAreaInsets.left = 0;
+            safeAreaInsets.right = 0;
+        }
+        UIEdgeInsets barInsets = MultitaskDockManager.shared.barReservedInsets;
+        safeAreaInsets.top    = MAX(safeAreaInsets.top    - barInsets.top,    0);
+        safeAreaInsets.left   = MAX(safeAreaInsets.left   - barInsets.left,   0);
+        safeAreaInsets.bottom = MAX(safeAreaInsets.bottom - barInsets.bottom, 0);
+        safeAreaInsets.right  = MAX(safeAreaInsets.right  - barInsets.right,  0);
         settings.peripheryInsets = safeAreaInsets;
         safeAreaInsets = UIEdgeInsetsZero;
     } else if(bottomWindowBar) {
@@ -544,7 +891,30 @@
     // scale peripheryInsets to match the scale ratio
     settings.peripheryInsets = UIEdgeInsetsMake(settings.peripheryInsets.top/_scaleRatio, settings.peripheryInsets.left/_scaleRatio, settings.peripheryInsets.bottom/_scaleRatio, settings.peripheryInsets.right/_scaleRatio);
     if(UIDevice.currentDevice.userInterfaceIdiom != UIUserInterfaceIdiomPad) {
-        UIInterfaceOrientation currentOrientation = UIApp.statusBarOrientation;
+        // HARD LOCK: while the phone is flat, do not re-derive the guest's
+        // orientation at all — reassert the one it had when the phone was last
+        // actually being held.
+        //
+        // Everything that decides a guest's orientation funnels through here, so
+        // this is where "flat means frozen" is cheapest to guarantee. It is a
+        // deliberate refusal to compute rather than a better computation: every
+        // earlier attempt at this bug tried to make the derivation smarter, and
+        // each one still had some input that resolved a face-up reading to
+        // portrait. Nothing derived from a device that is not answering can be
+        // trusted, so while it is not answering, nothing is derived.
+        UIInterfaceOrientation currentOrientation;
+        if(LCRotationIsLocked() && _lockedGuestOrientation != UIInterfaceOrientationUnknown) {
+            currentOrientation = _lockedGuestOrientation;
+        } else {
+            // The window's orientation, not the one the settings claim: they
+            // disagree exactly when this goes wrong.
+            currentOrientation = LCWindowOrientation(self.view, settings);
+            // Only remember an answer reached while the phone was being held.
+            if(!LCRotationIsLocked() && currentOrientation != UIInterfaceOrientationUnknown) {
+                _lockedGuestOrientation = currentOrientation;
+            }
+        }
+        settings.interfaceOrientation = currentOrientation;
         if(UIInterfaceOrientationIsLandscape(currentOrientation)) {
             safeAreaInsets.top = 0;
         }
@@ -553,14 +923,68 @@
     } else {
         settings.safeAreaInsetsPortrait = UIEdgeInsetsMake(settings.peripheryInsets.top, settings.peripheryInsets.left, settings.peripheryInsets.bottom, settings.peripheryInsets.right);
     }
+
+
     
+
     safeAreaInsets.bottom = 0;
     return safeAreaInsets;
 }
 
 - (void)updateMaximizedFrameWithSettings:(UIMutableApplicationSceneSettings *)settings {
-    CGRect maxFrame = UIEdgeInsetsInsetRect(self.view.window.frame, [self updateMaximizedSafeAreaWithSettings:settings]);
-    self.view.frame = maxFrame;
+    // Bounds, not frame: `frame` is in screen coordinates, and what is built here is
+    // a rectangle inside the window. The two agree exactly while the window is full
+    // screen, which on a phone it always is — and disagree by the window's origin
+    // when it is not, placing the guest off by that much.
+    CGRect maxFrame = UIEdgeInsetsInsetRect(self.view.window.bounds, [self updateMaximizedSafeAreaWithSettings:settings]);
+    // Reserve exactly the bar's strip thickness so the app sits flush with it — no
+    // background gap showing through. The dock reports the strip as insets on the
+    // edge the bar is actually drawn along, which is the only thing that answers
+    // this correctly once the layout and the device are not turned the same way;
+    // the interface orientation used to be asked instead, and it names an edge the
+    // bar may not be on. Zero insets when no bar is up.
+    UIEdgeInsets barInsets = MultitaskDockManager.shared.barReservedInsets;
+    maxFrame = UIEdgeInsetsInsetRect(maxFrame, barInsets);
+
+    // Held off the sensor housing, but only on the side it is really on.
+    //
+    // Upright the housing is above the window and nothing here has to care. Turned,
+    // it runs along one of the two long edges, and the window is otherwise laid out
+    // straight across it — so the guest draws underneath and the app's own content
+    // is what sits behind the island.
+    //
+    // Which edge cannot be read from the insets: iOS reports the same clearance on
+    // both sides of a turned window, so they say how much and never which. The
+    // orientation says which. In the other direction the housing shares its edge
+    // with the bar, whose strip is already reserved and already covers it, so
+    // nothing is held back there — a second reservation would only be a margin the
+    // app is pushed in by for no reason.
+    CGSize windowSize = self.view.window.bounds.size;
+    if(windowSize.width > windowSize.height) {
+        UIInterfaceOrientation windowOrientation = LCWindowOrientation(self.view, settings);
+        if(windowOrientation == UIInterfaceOrientationLandscapeRight && barInsets.left <= 0) {
+            CGFloat housing = self.view.window.safeAreaInsets.left;
+            maxFrame = UIEdgeInsetsInsetRect(maxFrame, UIEdgeInsetsMake(0, housing, 0, 0));
+        }
+    }
+
+
+
+    [self setWindowFrame:maxFrame];
+}
+
+/// Places the window through bounds and centre rather than `frame`.
+///
+/// A window carries a transform while it is growing out of its icon, or
+/// shrinking back into it, and `frame` is undefined under a transform —
+/// assigning it there is read back through the transform and leaves the window's
+/// bounds distorted for good. The scene reports its settings as the guest starts
+/// up, which is exactly when the opening animation is still running, so this path
+/// has to be safe to take mid-flight. With no transform it is identical to
+/// setting the frame.
+- (void)setWindowFrame:(CGRect)frame {
+    self.view.bounds = CGRectMake(0, 0, frame.size.width, frame.size.height);
+    self.view.center = CGPointMake(CGRectGetMidX(frame), CGRectGetMidY(frame));
 }
 
 - (void)updateWindowedFrameWithSettings:(UIMutableApplicationSceneSettings *)settings {
@@ -578,15 +1002,19 @@
     frame.origin.x = MAX(maxFrame.origin.x - oobOffset, MIN(CGRectGetMaxX(maxFrame) - frame.size.width + oobOffset, center.x - frame.size.width / 2));
     frame.origin.y = MAX(maxFrame.origin.y, MIN(center.y - frame.size.height / 2, CGRectGetMaxY(maxFrame) - frame.size.height));
     [UIView animateWithDuration:0.3 animations:^{
-        self.view.frame = frame;
+        [self setWindowFrame:frame];
     }];
 }
 
 - (void)updateOriginalFrame {
     if(_isMaximized) return;
     CGRect maxFrame = UIEdgeInsetsInsetRect(self.view.window.frame, self.view.window.safeAreaInsets);
+    // Derived from bounds and centre rather than frame, which is undefined while
+    // the window is animating into or out of its icon.
+    CGSize size = self.view.bounds.size;
+    CGPoint origin = CGPointMake(self.view.center.x - size.width / 2, self.view.center.y - size.height / 2);
     // save origin as normalized coordinates
-    self.originalFrame = CGRectMake(self.view.frame.origin.x / maxFrame.size.width, self.view.frame.origin.y / maxFrame.size.height, self.view.frame.size.width, self.view.frame.size.height);
+    self.originalFrame = CGRectMake(origin.x / maxFrame.size.width, origin.y / maxFrame.size.height, size.width, size.height);
 }
 
 @end

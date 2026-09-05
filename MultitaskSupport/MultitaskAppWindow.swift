@@ -75,8 +75,19 @@ struct AppSceneViewSwiftUI: UIViewControllerRepresentable {
                 let defaultInsets = vc.view.window?.safeAreaInsets ?? .zero
                 settings.peripheryInsets = defaultInsets
                 settings.safeAreaInsetsPortrait = defaultInsets
-                settings.deviceOrientation = UIDevice.current.orientation
                 settings.setInterfaceOrientation(UIApplication.shared.statusBarOrientation)
+                // Derived from the interface rather than the sensor, so the guest
+                // agrees with its window and Portrait Orientation Lock reaches it.
+                // Device and interface landscape names are mirror images.
+                // No `default` that answers portrait: unknown must leave the guest
+                // alone rather than be read as an instruction to stand upright.
+                switch settings.interfaceOrientation() {
+                case .portrait: settings.deviceOrientation = .portrait
+                case .landscapeLeft: settings.deviceOrientation = .landscapeRight
+                case .landscapeRight: settings.deviceOrientation = .landscapeLeft
+                case .portraitUpsideDown: settings.deviceOrientation = .portraitUpsideDown
+                default: break
+                }
                 if(settings.interfaceOrientation().isLandscape) {
                     settings.setFrame(CGRect(x: 0, y: 0, width: vc.view.frame.size.height, height: vc.view.frame.size.width))
                 } else {
@@ -129,7 +140,7 @@ struct MultitaskAppWindow: View {
     @EnvironmentObject var sceneDelegate: SceneDelegate
     @Environment(\.openWindow) var openWindow
     @AppStorage("LCMultitaskMode", store: LCUtils.appGroupUserDefault) var multitaskMode: MultitaskMode = .virtualWindow
-    @AppStorage("LCSkipTerminatedScreen", store: LCUtils.appGroupUserDefault) var skipTerminatedScreen = false
+    @AppStorage("LCSkipTerminatedScreen", store: LCUtils.appGroupUserDefault) var skipTerminatedScreen = true
     let pub = NotificationCenter.default.publisher(for: UIScene.didDisconnectNotification)
     init(id: String) {
         guard let appInfo = MultitaskWindowManager.appDict[id] else {
@@ -234,12 +245,29 @@ struct MultitaskAppWindow: View {
 class MultitaskRelaunchManager: NSObject {
     private static var pendingKeys: Set<String> = []
     private static let pendingLock = NSLock()
-    
+
+    /// Whether a window whose guest exited closes itself instead of standing there
+    /// with a termination notice, and whether the guest is then started again.
+    ///
+    /// Read as absent-means-on rather than through `bool(forKey:)`. Both switches
+    /// are declared `@AppStorage(...) = true`, and that default is only what the
+    /// switch draws — nothing is written to the store until the user flips it. A
+    /// plain `bool(forKey:)` reads the untouched key as false, so on a fresh
+    /// install Settings showed both switches on while the guest kept the
+    /// termination notice and never restarted. Same idiom as the dock's haptics
+    /// setting, which is declared the same way.
+    static var skipsTerminatedScreen: Bool {
+        LCUtils.appGroupUserDefault.object(forKey: "LCSkipTerminatedScreen") as? Bool ?? true
+    }
+    static var restartsTerminatedApp: Bool {
+        LCUtils.appGroupUserDefault.object(forKey: "LCRestartTerminatedApp") as? Bool ?? true
+    }
+
     static func scheduleRelaunchIfNeeded(bundleId: String, dataUUID: String, isManualTermination: Bool) {
         let defaults = LCUtils.appGroupUserDefault
         let multitaskMode = MultitaskMode(rawValue: defaults.integer(forKey: "LCMultitaskMode")) ?? .virtualWindow
-        guard defaults.bool(forKey: "LCSkipTerminatedScreen"),
-              defaults.bool(forKey: "LCRestartTerminatedApp"),
+        guard skipsTerminatedScreen,
+              restartsTerminatedApp,
               multitaskMode == .virtualWindow,
               !isManualTermination else { return }
         

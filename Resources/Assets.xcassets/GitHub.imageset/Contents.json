@@ -1,16 +1,15 @@
 {
   "images" : [
     {
+      "filename" : "3f915522ff10f5d6140e57eb3b3108168412385b.png",
       "idiom" : "universal",
       "scale" : "1x"
     },
     {
-      "filename" : "GitHub@2x.png",
       "idiom" : "universal",
       "scale" : "2x"
     },
     {
-      "filename" : "GitHub@3x.png",
       "idiom" : "universal",
       "scale" : "3x"
     }

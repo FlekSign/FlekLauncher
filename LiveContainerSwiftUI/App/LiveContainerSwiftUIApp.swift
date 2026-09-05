@@ -10,7 +10,24 @@ import SwiftUI
 struct LiveContainerSwiftUIApp : SwiftUI.App {
     @UIApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
     
+    // appDataFolderNames and tweakFolderNames used to be @State here and were
+    // threaded down as bindings. Upstream moved them onto DataManager's shared
+    // model, which is populated at the end of init() below, so the views read
+    // them from the environment instead.
     init() {
+        // The identifier guest apps check against lives in this app's Info.plist,
+        // but a guest launched in parallel runs inside LiveProcess.appex and reads
+        // the bundle of *that* process, which never carries it. Publish it to the
+        // app group here so the extension is handed the value rather than having to
+        // find this bundle on disk — a search that lands on the wrong app entirely
+        // when the extension in use belongs to another LiveContainer install.
+        if let hostEncryptedUdid = Bundle.main.infoDictionary?["encryptedUdid"] as? String,
+           !hostEncryptedUdid.isEmpty {
+            LCUtils.appGroupUserDefault.set(hostEncryptedUdid, forKey: "LCHostEncryptedUdid")
+        }
+
+        LCPath.clearStaleShareInbox()
+
         let fm = FileManager()
         var tempAppDataFolderNames : [String] = []
         var tempTweakFolderNames : [String] = []
@@ -22,7 +39,13 @@ struct LiveContainerSwiftUIApp : SwiftUI.App {
         do {
             // load apps
             try fm.createDirectory(at: LCPath.bundlePath, withIntermediateDirectories: true)
-            let appDirs = try fm.contentsOfDirectory(atPath: LCPath.bundlePath.path)
+            var appDirs = try fm.contentsOfDirectory(atPath: LCPath.bundlePath.path)
+            // Launch is the one moment nothing else is in these folders, so it is
+            // where an install that died mid-replace gets its app back.
+            if appDirs.contains(where: { $0.hasSuffix(LCPath.replacingSuffix) }) {
+                LCPath.recoverInterruptedReplaces(in: LCPath.bundlePath, contents: appDirs)
+                appDirs = try fm.contentsOfDirectory(atPath: LCPath.bundlePath.path)
+            }
             for appDir in appDirs {
                 if !appDir.hasSuffix(".app") {
                     continue
@@ -39,7 +62,11 @@ struct LiveContainerSwiftUIApp : SwiftUI.App {
             }
             if LCPath.lcGroupDocPath != LCPath.docPath {
                 try fm.createDirectory(at: LCPath.lcGroupBundlePath, withIntermediateDirectories: true)
-                let appDirsShared = try fm.contentsOfDirectory(atPath: LCPath.lcGroupBundlePath.path)
+                var appDirsShared = try fm.contentsOfDirectory(atPath: LCPath.lcGroupBundlePath.path)
+                if appDirsShared.contains(where: { $0.hasSuffix(LCPath.replacingSuffix) }) {
+                    LCPath.recoverInterruptedReplaces(in: LCPath.lcGroupBundlePath, contents: appDirsShared)
+                    appDirsShared = try fm.contentsOfDirectory(atPath: LCPath.lcGroupBundlePath.path)
+                }
                 for appDir in appDirsShared {
                     if !appDir.hasSuffix(".app") {
                         continue
@@ -99,13 +126,30 @@ struct LiveContainerSwiftUIApp : SwiftUI.App {
         }
         
         if UIApplication.shared.supportsMultipleScenes, #available(iOS 16.1, *) {
-            WindowGroup(id: "appView", for: String.self) { $id in
-                if let id {
-                    MultitaskAppWindow(id: id)
-                }
-            }
-
+            MultitaskScene()
         }
     }
-    
+
+}
+
+/// The multi-window scene, isolated behind its own availability-annotated type.
+///
+/// `WindowGroup(id:for:)` produces `PresentedWindowContent`, which is iOS 16.0+.
+/// Inlined in `body` above, that type would land in the App's `Body` — and
+/// SwiftUI resolves `Body` at launch, before any `#available` check runs, so
+/// iOS 15 would trap on start rather than skipping the scene. Referencing
+/// `MultitaskScene` instead is safe on every version because its metadata lives
+/// in our own binary; its `Body` is only resolved if the scene is actually
+/// built, which the guard above prevents. There is no `AnyScene`, so this
+/// indirection is the Scene-level equivalent of the AnyView erasure used for
+/// version-gated views.
+@available(iOS 16.1, *)
+private struct MultitaskScene: Scene {
+    var body: some Scene {
+        WindowGroup(id: "appView", for: String.self) { $id in
+            if let id {
+                MultitaskAppWindow(id: id)
+            }
+        }
+    }
 }

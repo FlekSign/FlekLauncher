@@ -36,7 +36,7 @@ struct LCDataManagementView : View {
         _folderPaths = State(initialValue: [
             LCFolderPath(path: LCPath.docPath, desc: "Private Container"),
             LCFolderPath(path: LCPath.lcGroupDocPath, desc: "App Group Container"),
-            LCFolderPath(path: Bundle.main.bundleURL, desc: "LiveContainer Bundle"),
+            LCFolderPath(path: Bundle.main.bundleURL, desc: "FlekDeck Bundle"),
         ])
     }
     
@@ -119,8 +119,8 @@ struct LCDataManagementView : View {
                 }
             }
         }
-        .navigationTitle("lc.settings.dataManagement".loc)
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar { ToolbarItem(placement: .principal) { Text("lc.settings.dataManagement".loc).font(.headline) } }
         .alert("lc.common.error".loc, isPresented: $errorShow){
         } message: {
             Text(errorInfo)

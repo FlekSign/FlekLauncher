@@ -38,6 +38,61 @@ struct LCPath {
     public static let lcGroupAppGroupPath = lcGroupDocPath.appendingPathComponent("Data/AppGroup")
     public static let lcGroupTweakPath = lcGroupDocPath.appendingPathComponent("Tweaks")
     
+    /// Drops staging folders the share extension left behind, where the install
+    /// they were copied for never ran — the app was never opened by the install
+    /// URL, or was killed before it was done with the file. Nothing else clears
+    /// them, and each one holds a whole IPA.
+    ///
+    /// Called at launch, which is the one moment no install is in flight. That
+    /// includes the launch the share itself causes, so only folders too old to
+    /// be the one being handed over right now are taken.
+    public static func clearStaleShareInbox() {
+        guard let shareInbox = LCSharedUtils.shareInboxPath() else {
+            return
+        }
+        let fm = FileManager()
+        guard let staged = try? fm.contentsOfDirectory(
+            at: shareInbox, includingPropertiesForKeys: [.contentModificationDateKey]) else {
+            return
+        }
+        let cutoff = Date().addingTimeInterval(-3600)
+        for folder in staged {
+            let modified = (try? folder.resourceValues(
+                forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+            if modified < cutoff {
+                try? fm.removeItem(at: folder)
+            }
+        }
+    }
+
+    /// Appended to the folder of an app that is being replaced, for as long as
+    /// its replacement is being moved into place. See `recoverInterruptedReplaces`.
+    public static let replacingSuffix = ".replacing"
+
+    /// Puts back an app whose replacement never arrived.
+    ///
+    /// Installing over an existing app parks the old bundle under
+    /// `<name>.app.replacing` and drops it once the new bundle is in place. If
+    /// the process is killed in between, the app is left under that name — where
+    /// nothing looks for it, since the app list only reads folders ending in
+    /// `.app`. Restore it unless the replacement did land after all, in which
+    /// case the leftover is just the old copy and can go.
+    ///
+    /// Called for both the private and the shared Applications folder at launch,
+    /// which is the only moment nothing else is touching them.
+    public static func recoverInterruptedReplaces(in applicationsPath: URL, contents: [String]) {
+        let fm = FileManager()
+        for folderName in contents where folderName.hasSuffix(replacingSuffix) {
+            let backup = applicationsPath.appendingPathComponent(folderName)
+            let original = applicationsPath.appendingPathComponent(String(folderName.dropLast(replacingSuffix.count)))
+            if fm.fileExists(atPath: original.path) {
+                try? fm.removeItem(at: backup)
+            } else {
+                try? fm.moveItem(at: backup, to: original)
+            }
+        }
+    }
+
     public static func ensureAppGroupPaths() throws {
         let fm = FileManager()
         if !fm.fileExists(atPath: LCPath.lcGroupBundlePath.path) {
@@ -55,6 +110,13 @@ struct LCPath {
 class SharedModel: ObservableObject {
     @Published var selectedTab: LCTabIdentifier = .apps
     @Published var deepLink: URL?
+    /// A URL that arrived before any window was ready to act on it, held until
+    /// one is. It lives here rather than on the window that received it because
+    /// that window is often not the one that survives: opening a document from
+    /// the Files app hands it to a newly connected scene, which this app then
+    /// closes as a duplicate — taking a URL parked in the scene's own state
+    /// with it, which is why an IPA opened that way did nothing at all.
+    @Published var pendingOpenURL: URL?
     
     @Published var isHiddenAppUnlocked = false
     @Published var developerMode = false
@@ -72,7 +134,7 @@ class SharedModel: ObservableObject {
     @Published var hiddenApps : [LCAppModel] = []
     
     @Published var pidCallback : ((NSNumber, Error?) -> Void)? = nil
-    
+
     static let isPhone: Bool = {
         UIDevice.current.userInterfaceIdiom == .phone
     }()
@@ -93,7 +155,7 @@ class SharedModel: ObservableObject {
     public static let keychainAccessGroupCount = 128
     
     func updateMultiLCStatus() {
-        if LCUtils.appUrlScheme()?.lowercased() != "livecontainer" {
+        if LCUtils.appUrlScheme()?.lowercased() != "flekdeck" {
             multiLCStatus = 2
         } else {
             multiLCStatus = 0
@@ -310,8 +372,10 @@ extension NSNotification {
 public enum LCTabIdentifier: Hashable {
     case sources
     case apps
+    case browse
     case tweaks
     case settings
+    case search
 }
 
 
@@ -362,3 +426,4 @@ enum BatchMoveError: LocalizedError {
     }
 
 }
+

@@ -7,3 +7,13 @@ packages/
 xcuserdata
 Resources/Frameworks/OpenSSL.framework
 apps_nightly.json
+
+# Local simulator build artifacts (see run-simulator.sh)
+build/
+.spm-checkouts/
+run-simulator.sh
+
+# Certificates and signing files (never commit these!)
+*.p12
+*.mobileprovision
+*_base64.txt

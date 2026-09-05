@@ -590,131 +590,51 @@ struct LCAppSettingsView: View {
         }
     }
 
+    /// Both conversions live on the model — the home screen converts a shared
+    /// app to private on its way to being deleted, so the settings screen is no
+    /// longer the only way in. What is left here is the asking: the check that
+    /// runs before the user is put to a decision, the confirmation itself, and
+    /// where the reasons a conversion stops are shown.
     func moveToAppGroup() async {
-        for container in appInfo.containers {
-            if let runningLC = LCSharedUtils.getContainerUsingLCScheme(withFolderName: container.folderName) {
-                errorInfo = "lc.appSettings.appOpenInOtherLc %@ %@".localizeWithFormat(runningLC, runningLC)
-                errorShow = true
-                return
-            }
+        do {
+            try model.checkContainersNotInUse()
+        } catch {
+            errorInfo = error.localizedDescription
+            errorShow = true
+            return
         }
-        
+
         guard let result = await moveToAppGroupAlert.open(), result else {
             return
         }
-        
-        do {
-            try LCPath.ensureAppGroupPaths()
 
-            var moves: [(URL, URL)] = [];
-            moves.append((
-                URL(fileURLWithPath: appInfo.bundlePath()),
-                LCPath.lcGroupBundlePath.appendingPathComponent(appInfo.relativeBundlePath)
-            ))
-            for container in model.uiContainers {
-                if container.storageBookMark != nil {
-                    continue
-                }
-                
-                moves.append((
-                    LCPath.dataPath.appendingPathComponent(container.folderName),
-                    LCPath.lcGroupDataPath.appendingPathComponent(container.folderName)
-                ))
-            }
-            if let tweakFolder = appInfo.tweakFolder, tweakFolder.count > 0 {
-                moves.append((
-                    LCPath.tweakPath.appendingPathComponent(tweakFolder),
-                    LCPath.lcGroupTweakPath.appendingPathComponent(tweakFolder)
-                ))
-            }
-            
-            try LCUtils.moveFilesAtomicallyAfterPreflight(moves)
-            
-            for container in model.uiContainers {
-                if container.storageBookMark != nil {
-                    continue
-                }
-                sharedModel.appDataFolderNames.removeAll(where: { s in
-                    return s == container.folderName
-                })
-                container.isShared = true
-            }
-            
-            if let tweakFolder = appInfo.tweakFolder, tweakFolder.count > 0 {
-                sharedModel.tweakFolderNames.removeAll(where: { s in
-                    return s == tweakFolder
-                })
-            }
-            
-            appInfo.setBundlePath(LCPath.lcGroupBundlePath.appendingPathComponent(appInfo.relativeBundlePath).path)
-            appInfo.isShared = true
-            model.uiIsShared = true
+        do {
+            try model.convertToShared(sharedModel: sharedModel)
         } catch {
             errorInfo = error.localizedDescription
             errorShow = true
         }
-        
     }
-    
+
     func movePrivateDoc() async {
-        for container in appInfo.containers {
-            if let runningLC = LCSharedUtils.getContainerUsingLCScheme(withFolderName: container.folderName) {                
-                errorInfo = "lc.appSettings.appOpenInOtherLc %@ %@".localizeWithFormat(runningLC, runningLC)
-                errorShow = true
-                return
-            }
+        do {
+            try model.checkContainersNotInUse()
+        } catch {
+            errorInfo = error.localizedDescription
+            errorShow = true
+            return
         }
 
         guard let result = await moveToPrivateDocAlert.open(), result else {
             return
         }
-        
+
         do {
-            var moves: [(URL, URL)] = [];
-            moves.append((
-                URL(fileURLWithPath: appInfo.bundlePath()),
-                LCPath.bundlePath.appendingPathComponent(appInfo.relativeBundlePath)
-            ))
-            for container in model.uiContainers {
-                if container.storageBookMark != nil {
-                    continue
-                }
-                moves.append((
-                    LCPath.lcGroupDataPath.appendingPathComponent(container.folderName),
-                    LCPath.dataPath.appendingPathComponent(container.folderName)
-                ))
-            }
-            if let tweakFolder = appInfo.tweakFolder, tweakFolder.count > 0 {
-                moves.append((
-                    LCPath.lcGroupTweakPath.appendingPathComponent(tweakFolder),
-                    LCPath.tweakPath.appendingPathComponent(tweakFolder)
-                ))
-            }
-            
-            try LCUtils.moveFilesAtomicallyAfterPreflight(moves)
-            
-            for container in model.uiContainers {
-                if container.storageBookMark != nil {
-                    continue
-                }
-                sharedModel.appDataFolderNames.append(container.folderName)
-            }
-            if let tweakFolder = appInfo.tweakFolder, tweakFolder.count > 0 {
-                sharedModel.tweakFolderNames.append(tweakFolder)
-                model.uiTweakFolder = tweakFolder
-            }
-            
-            appInfo.setBundlePath(LCPath.bundlePath.appendingPathComponent(appInfo.relativeBundlePath).path)
-            appInfo.isShared = false
-            model.uiIsShared = false
-            for container in model.uiContainers {
-                container.isShared = false
-            }
+            try model.convertToPrivate(sharedModel: sharedModel, movingTweakFolder: true)
         } catch {
             errorInfo = error.localizedDescription
             errorShow = true
         }
-        
     }
     
     func loadSupportedLanguages() {

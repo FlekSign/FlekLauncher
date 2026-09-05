@@ -102,7 +102,11 @@ public struct DocModifier: ViewModifier {
                 controller.allowsMultipleSelection = multiple
                 controller.delegate = delegate
                 self.docController = controller
-                sceneDelegate.window?.rootViewController?.present(controller, animated: true)
+                var topVC = sceneDelegate.window?.rootViewController
+                while let presented = topVC?.presentedViewController {
+                    topVC = presented
+                }
+                topVC?.present(controller, animated: true)
             } else if !isPresented, let docController = docController {
                 docController.dismiss(animated: true)
                 self.docController = nil
@@ -152,7 +156,11 @@ public struct TextFieldAlertModifier: ViewModifier {
             if isPresented, alertController == nil {
                 let alertController = makeAlertController()
                 self.alertController = alertController
-                sceneDelegate.window?.rootViewController?.present(alertController, animated: true)
+                var topVC = sceneDelegate.window?.rootViewController
+                while let presented = topVC?.presentedViewController {
+                    topVC = presented
+                }
+                topVC?.present(alertController, animated: true)
             } else if !isPresented, let alertController = alertController {
                 alertController.dismiss(animated: true)
                 self.alertController = nil
@@ -328,7 +336,7 @@ struct IconImageView: View {
             Image(uiImage: icon)
                 .resizable()
                 .aspectRatio(contentMode: .fit)
-                .clipShape(RoundedRectangle(cornerRadius: g.size.width*0.2667))
+                .clipShape(RoundedRectangle(cornerRadius: g.size.width * 0.2237, style: .continuous))
         }
     }
 }

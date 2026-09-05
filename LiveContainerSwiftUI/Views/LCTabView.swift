@@ -7,56 +7,40 @@
 
 import Foundation
 import SwiftUI
+import ObjectiveC
 
 struct LCTabView: View {
     @State var errorShow = false
     @State var crashReportShow = false
     @State var errorInfo = ""
+    @State private var isiOSBeta = false
+    @AppStorage("LCBetaBannerOverride", store: LCUtils.appGroupUserDefault) private var betaBannerOverride: Int = 0
+    
+    @State var previousSelectedTab : LCTabIdentifier = .apps
+    @State private var didRunStartup = false
     
     @EnvironmentObject var sharedModel : SharedModel
     @EnvironmentObject var sceneDelegate: SceneDelegate
     @State var shouldToggleMainWindowOpen = false
     @Environment(\.scenePhase) var scenePhase
-    @StateObject var downloadHelper = DownloadHelper()
 
+    
+    @StateObject var searchContextAppList = SearchContext()
+    @StateObject var searchContextSource = SearchContext()
+    
     let pub = NotificationCenter.default.publisher(for: UIScene.didDisconnectNotification)
     
     var body: some View {
-        TabView(selection: $sharedModel.selectedTab) {
-            if DataManager.shared.model.multiLCStatus != 2 {
-                LCSourcesView()
-                    .tabItem {
-                        Label("lc.tabView.sources".loc, systemImage: "books.vertical")
-                    }
-                    .tag(LCTabIdentifier.sources)
-            }
-            LCAppListView()
-                .tabItem {
-                    Label("lc.tabView.apps".loc, systemImage: "square.stack.3d.up.fill")
-                }
-                .tag(LCTabIdentifier.apps)
-            if DataManager.shared.model.multiLCStatus != 2 {
-                LCTweaksView()
-                    .tabItem{
-                        Label("lc.tabView.tweaks".loc, systemImage: "wrench.and.screwdriver")
-                    }
-                    .tag(LCTabIdentifier.tweaks)
-            }
-            
-            LCSettingsView()
-                .tabItem {
-                    Label("lc.tabView.settings".loc, systemImage: "gearshape.fill")
-                }
-                .tag(LCTabIdentifier.settings)
+        Group {
+            // FlekDeck: the springboard home screen replaces the old tab bar.
+            // Settings and the Installer are now opened as full-screen pages from
+            // the home screen instead of being separate tabs.
+            LCAppListView(searchContext: searchContextAppList)
         }
-        .downloadAlert(helper: downloadHelper)
-        .environmentObject(downloadHelper)
-        .alert("lc.common.error".loc, isPresented: $errorShow){
-            Button("lc.common.ok".loc, action: {
-            })
-            Button("lc.common.copy".loc, action: {
-                copyError()
-            })
+        .modifier(DeferBottomHomeGestureModifier())
+        .alert("lc.common.error".loc, isPresented: $errorShow) {
+            Button("lc.common.ok".loc) {}
+            Button("lc.common.copy".loc) { copyError() }
         } message: {
             Text(errorInfo)
         }
@@ -87,12 +71,9 @@ struct LCTabView: View {
             }
         }
         .task {
-            closeDuplicatedWindow()
-            checkLastLaunchError()
-            checkTeamId()
-            checkAndSaveBundleId()
-            checkGetTaskAllow()
-            checkPrivateContainerBookmark()
+            setupInitialRepositoriesIfNeeded()
+            Task { await MultiRepoSearchModel.prefetchAllRepos() }
+            runStartupIfNeeded()
         }
         .onReceive(pub) { out in
             if let scene1 = sceneDelegate.window?.windowScene, let scene2 = out.object as? UIWindowScene, scene1 == scene2 {
@@ -101,8 +82,19 @@ struct LCTabView: View {
                 }
             }
         }
+        .onChange(of: sharedModel.selectedTab) { newValue in
+            if newValue != LCTabIdentifier.search {
+                previousSelectedTab = newValue
+            }
+        }
+        .onChange(of: betaBannerOverride) { _ in
+            updateBetaOverlay()
+        }
         .onOpenURL { url in
             dispatchURL(url: url)
+        }
+        .onChange(of: sharedModel.pendingOpenURL) { _ in
+            processPendingURLIfNeeded()
         }
     }
     
@@ -133,10 +125,23 @@ struct LCTabView: View {
             }
             
         } while(false)
-
+        
         sharedModel.deepLink = url
     }
+
+    /// Takes whatever URL is waiting, if this window is in a state to act on it.
+    /// Every window runs this, and the first one through clears the URL, so a
+    /// window that is about to be closed as a duplicate can park a document and
+    /// have the window that stays open install it.
+    func processPendingURLIfNeeded() {
+        guard let url = sharedModel.pendingOpenURL else {
+            return
+        }
+        sharedModel.pendingOpenURL = nil
+        dispatchURL(url: url)
+    }
     
+    // MARK: - Existing helper functions
     func closeDuplicatedWindow() {
         if let session = sceneDelegate.window?.windowScene?.session, DataManager.shared.model.mainWindowOpened {
             UIApplication.shared.requestSceneSessionDestruction(session, options: nil) { e in
@@ -150,23 +155,18 @@ struct LCTabView: View {
     
     func checkLastLaunchError() {
         var errorStr = UserDefaults.standard.string(forKey: "error")
-        
         if errorStr == nil && UserDefaults.standard.bool(forKey: "SigningInProgress") {
             errorStr = "lc.signer.crashDuringSignErr".loc
             UserDefaults.standard.removeObject(forKey: "SigningInProgress")
         }
-        
-        guard let errorStr else {
-            return
-        }
+        guard let errorStr else { return }
         UserDefaults.standard.removeObject(forKey: "error")
         errorInfo = errorStr
         crashReportShow = true
     }
     
-    func copyError() {
-        UIPasteboard.general.string = errorInfo
-    }
+    func copyError() { UIPasteboard.general.string = errorInfo }
+    
     
     func checkTeamId() {
         if let certificateTeamId = UserDefaults.standard.string(forKey: "LCCertificateTeamId") {
@@ -234,7 +234,7 @@ struct LCTabView: View {
         
         if(bundleId != correctBundleId) {
             errorInfo = "lc.settings.bundleIdMismatch %@ %@".localizeWithFormat(bundleId, correctBundleId)
-            errorShow = true
+            //errorShow = true
         }
         UserDefaults.standard.set(true, forKey: "LCBundleIdChecked")
     }
@@ -248,6 +248,64 @@ struct LCTabView: View {
         }
     }
     
+    /// Seeds nothing. This build ships with no sources of its own: the user
+    /// either imports an IPA by hand or adds a repository themselves, and an
+    /// empty list is what makes that the only way in.
+    ///
+    /// Kept as a no-op rather than deleted at the call site so the first-launch
+    /// flag stays claimed — a later build that does want to seed something can
+    /// tell a fresh install from one that has already been through this.
+    private func setupInitialRepositoriesIfNeeded() {
+        UserDefaults.standard.set(true, forKey: "DidSetupDefaultRepositories")
+    }
+
+    /// One-time startup work. Kept idempotent and behind a flag because the
+    /// task it runs from can be re-entered when a scene reconnects.
+    @MainActor
+    private func runStartupIfNeeded() {
+        guard !didRunStartup else {
+            return
+        }
+        didRunStartup = true
+
+        sharedModel.selectedTab = .apps
+        closeDuplicatedWindow()
+        checkLastLaunchError()
+        checkTeamId()
+        checkAndSaveBundleId()
+        checkGetTaskAllow()
+        checkPrivateContainerBookmark()
+        checkiOSBeta()
+        processPendingURLIfNeeded()
+    }
+
+    func checkiOSBeta() {
+        // Beta iOS builds have a build version ending with a lowercase letter (e.g. 22A5307f)
+        if let buildVersion = UIDevice.current.buildVersion,
+           let lastChar = buildVersion.last,
+           lastChar.isLowercase {
+            isiOSBeta = true
+        }
+        updateBetaOverlay()
+    }
+
+    private func updateBetaOverlay() {
+        let shouldShow: Bool
+        switch betaBannerOverride {
+        case 1: shouldShow = true
+        case 2: shouldShow = false
+        default: shouldShow = isiOSBeta
+        }
+
+        if let scene = sceneDelegate.window?.windowScene {
+            if shouldShow {
+                BetaOverlayManager.shared.show(on: scene)
+            } else {
+                BetaOverlayManager.shared.hide()
+            }
+        }
+    }
+
     func checkPrivateContainerBookmark() {
         if sharedModel.multiLCStatus == 2 {
             return
@@ -262,5 +320,131 @@ struct LCTabView: View {
             return
         }
         LCUtils.appGroupUserDefault.set(bookmark, forKey: "LCLaunchExtensionPrivateDocBookmark")
+    }
+}
+/// Requires a double-swipe to trigger the bottom system edge gesture
+/// (swipe-up-to-home), preventing accidental exits.
+///
+/// The home indicator is intentionally left VISIBLE. iOS treats hiding the
+/// indicator and deferring the home gesture as mutually exclusive: the deferral
+/// works by revealing the indicator on the first swipe and only performing the
+/// gesture on the second, so if the indicator is already hidden a single swipe
+/// exits and the deferral has no effect. Showing the indicator is therefore a
+/// hard requirement for the two-swipe behaviour — do not re-add
+/// `.persistentSystemOverlays(.hidden)` here.
+private struct DeferBottomHomeGestureModifier: ViewModifier {
+    // Erased to AnyView: `defersSystemGestures` is iOS 16+, and an opaque return
+    // type would bake its modifier type into Body. The runtime resolves Body
+    // before the availability check ever runs, so iOS 15 would trap here.
+    func body(content: Content) -> AnyView {
+        if #available(iOS 16.0, *) {
+            return AnyView(
+                content
+                    .defersSystemGestures(on: .bottom)
+                    // SwiftUI's `.defersSystemGestures(on:)` frequently fails to
+                    // propagate `preferredScreenEdgesDeferringSystemGestures` to the
+                    // window's view controllers, so also install it directly on the
+                    // hosting controller at runtime as a reliable backstop.
+                    .background(BottomEdgeGestureDeferralInstaller())
+            )
+        }
+        return AnyView(content)
+    }
+}
+
+/// Zero-size helper that, once attached to a window, forces iOS to defer the
+/// bottom screen-edge system gesture (swipe-up-to-home) by installing
+/// `preferredScreenEdgesDeferringSystemGestures` directly on SwiftUI's
+/// UIHostingController base class. This is the reliable path when the SwiftUI
+/// `.defersSystemGestures` modifier is ignored.
+///
+/// Caveat: this preference is advisory. iOS still overrides it whenever it
+/// decides the user clearly intends to go home, so a firm, deliberate swipe may
+/// still leave in a single gesture on some devices / iOS versions — Apple
+/// intentionally protects the home gesture and this cannot be fully defeated.
+private struct BottomEdgeGestureDeferralInstaller: UIViewRepresentable {
+    func makeUIView(context: Context) -> UIView {
+        let view = InstallerView()
+        view.isUserInteractionEnabled = false
+        view.backgroundColor = .clear
+        return view
+    }
+    func updateUIView(_ uiView: UIView, context: Context) {}
+
+    private final class InstallerView: UIView {
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            guard let root = window?.rootViewController else { return }
+            ScreenEdgeGestureDeferrer.install(fromRoot: root)
+        }
+    }
+}
+
+/// Runtime swizzler that makes every SwiftUI `UIHostingController` report the
+/// bottom edge as deferring system gestures.
+private enum ScreenEdgeGestureDeferrer {
+    /// Hosting classes already swizzled, so repeated installs are no-ops.
+    private static var swizzledClasses = Set<ObjectIdentifier>()
+
+    static func install(fromRoot root: UIViewController) {
+        let base = hostingControllerBaseClass(of: root) ?? object_getClass(root)
+        swizzle(hostingBase: base)
+        refresh(from: root)
+    }
+
+    /// Walks up the class hierarchy of `vc` and returns the highest-level class
+    /// whose name identifies it as a SwiftUI `UIHostingController` — the base
+    /// that every specialised `UIHostingController<Content>` inherits from, so
+    /// swizzling it covers the root screen and every full-screen cover alike.
+    private static func hostingControllerBaseClass(of vc: UIViewController) -> AnyClass? {
+        var result: AnyClass? = nil
+        var cls: AnyClass? = object_getClass(vc)
+        while let c = cls {
+            if String(cString: class_getName(c)).contains("UIHostingController") {
+                result = c
+            }
+            cls = class_getSuperclass(c)
+        }
+        return result
+    }
+
+    private static func swizzle(hostingBase cls: AnyClass?) {
+        guard let cls else { return }
+        let id = ObjectIdentifier(cls)
+        guard !swizzledClasses.contains(id) else { return }
+        swizzledClasses.insert(id)
+
+        // preferredScreenEdgesDeferringSystemGestures → previous value ∪ .bottom
+        let preferredSel = #selector(getter: UIViewController.preferredScreenEdgesDeferringSystemGestures)
+        if let method = class_getInstanceMethod(cls, preferredSel) {
+            let previousIMP = method_getImplementation(method)
+            let typeEnc = method_getTypeEncoding(method)
+            let block: @convention(block) (UIViewController) -> UIRectEdge = { obj in
+                typealias Getter = @convention(c) (UIViewController, Selector) -> UIRectEdge
+                let previous = unsafeBitCast(previousIMP, to: Getter.self)(obj, preferredSel)
+                return previous.union(.bottom)
+            }
+            class_replaceMethod(cls, preferredSel, imp_implementationWithBlock(block), typeEnc)
+        }
+
+        // childForScreenEdgesDeferringSystemGestures → nil, so the system reads
+        // each hosting controller's own (now-deferred) preference instead of
+        // forwarding to a child SwiftUI never wired up. This is a distinct path
+        // from the home-indicator-hidden forwarding, which is left untouched.
+        let childSel = #selector(getter: UIViewController.childForScreenEdgesDeferringSystemGestures)
+        if let method = class_getInstanceMethod(cls, childSel) {
+            let typeEnc = method_getTypeEncoding(method)
+            let block: @convention(block) (UIViewController) -> UIViewController? = { _ in nil }
+            class_replaceMethod(cls, childSel, imp_implementationWithBlock(block), typeEnc)
+        }
+    }
+
+    /// Asks the current controller stack to re-query the now-swizzled prefs.
+    private static func refresh(from root: UIViewController) {
+        var vc: UIViewController? = root
+        while let current = vc {
+            current.setNeedsUpdateOfScreenEdgesDeferringSystemGestures()
+            vc = current.presentedViewController
+        }
     }
 }

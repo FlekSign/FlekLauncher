@@ -135,6 +135,17 @@
     }
 }
 
+- (void)overrideBundleIdentifier:(NSString*)newBundleId {
+    NSString* currentId = _infoPlist[@"CFBundleIdentifier"];
+    if (newBundleId.length > 0 && ![newBundleId isEqualToString:currentId]) {
+        _info[@"LCPreCustomBundleId"] = currentId;
+        _infoPlist[@"CFBundleIdentifier"] = newBundleId;
+        NSString *infoPath = [NSString stringWithFormat:@"%@/Info.plist", _bundlePath];
+        [_infoPlist writeBinToFile:infoPath atomically:YES];
+        [self save];
+    }
+}
+
 - (NSString*)dataUUID {
     return _info[@"LCDataUUID"];
 }
@@ -183,6 +194,24 @@
         return _cachedIconDark;
     }
     
+    // An icon the user chose when installing the app wins over anything derived
+    // from the bundle. It is kept under its own name rather than in the cache
+    // files below, which "Clear Icon Cache" deletes — a deliberate choice must
+    // survive that. The same image is used for both appearances.
+    NSString* customIconPath = [_bundlePath stringByAppendingPathComponent:@"LCCustomIcon.png"];
+    if([NSFileManager.defaultManager fileExistsAtPath:customIconPath]) {
+        CGImageRef customImageRef = loadCGImageFromURL([NSURL fileURLWithPath:customIconPath]);
+        if(customImageRef) {
+            UIImage* customIcon = [UIImage imageWithCGImage:customImageRef];
+            if(isDarkIcon) {
+                _cachedIconDark = customIcon;
+            } else {
+                _cachedIcon = customIcon;
+            }
+            return customIcon;
+        }
+    }
+
     // check if icon is cached on disk
     UIImage* uiIcon;
     NSString* cachedIconPath;
@@ -200,7 +229,7 @@
     
     // generate and save icon cache to disk
     if(!uiIcon) {
-        uiIcon = [UIImage generateIconForBundleURL:[NSURL fileURLWithPath:_bundlePath] style:isDarkIcon hasBorder:YES];
+        uiIcon = [UIImage generateIconForBundleURL:[NSURL fileURLWithPath:_bundlePath] style:isDarkIcon hasBorder:NO];
         saveCGImage([uiIcon CGImage], cachedIconUrl);
     }
     
@@ -247,9 +276,9 @@
 - (NSDictionary *)generateWebClipConfigWithContainerId:(NSString*)containerId iconStyle:(GeneratedIconStyle)style{
     NSString* appClipUrl;
     if(containerId) {
-        appClipUrl = [NSString stringWithFormat:@"livecontainer://livecontainer-launch?bundle-name=%@&container-folder-name=%@", self.bundlePath.lastPathComponent, containerId];
+        appClipUrl = [NSString stringWithFormat:@"flekdeck://livecontainer-launch?bundle-name=%@&container-folder-name=%@", self.bundlePath.lastPathComponent, containerId];
     } else {
-        appClipUrl = [NSString stringWithFormat:@"livecontainer://livecontainer-launch?bundle-name=%@", self.bundlePath.lastPathComponent];
+        appClipUrl = [NSString stringWithFormat:@"flekdeck://livecontainer-launch?bundle-name=%@", self.bundlePath.lastPathComponent];
     }
     
     UIImage* icon = [self generateLiveContainerWrappedIconWithStyle:style];
@@ -260,25 +289,25 @@
         @"IgnoreManifestScope": @YES,
         @"IsRemovable": @YES,
         @"Label": self.displayName,
-        @"PayloadDescription": [NSString stringWithFormat:@"Web Clip for launching %@ (%@) in LiveContainer", self.displayName, self.bundlePath.lastPathComponent],
+        @"PayloadDescription": [NSString stringWithFormat:@"Web Clip for launching %@ (%@) in FlekDeck", self.displayName, self.bundlePath.lastPathComponent],
         @"PayloadDisplayName": self.displayName,
         @"PayloadIdentifier": self.bundleIdentifier,
         @"PayloadType": @"com.apple.webClip.managed",
         @"PayloadUUID": NSUUID.UUID.UUIDString,
         @"PayloadVersion": @(1),
         @"Precomposed": @NO,
-        @"toPayloadOrganization": @"LiveContainer",
+        @"toPayloadOrganization": @"FlekDeck",
         @"URL": appClipUrl
     };
     return @{
         @"ConsentText": @{
-            @"default": [NSString stringWithFormat:@"This profile installs a web clip which opens %@ (%@) in LiveContainer", self.displayName, self.bundlePath.lastPathComponent]
+            @"default": [NSString stringWithFormat:@"This profile installs a web clip which opens %@ (%@) in FlekDeck", self.displayName, self.bundlePath.lastPathComponent]
         },
         @"PayloadContent": @[payload],
         @"PayloadDescription": payload[@"PayloadDescription"],
         @"PayloadDisplayName": self.displayName,
         @"PayloadIdentifier": self.bundleIdentifier,
-        @"PayloadOrganization": @"LiveContainer",
+        @"PayloadOrganization": @"FlekDeck",
         @"PayloadRemovalDisallowed": @(NO),
         @"PayloadType": @"Configuration",
         @"PayloadUUID": @"345097fb-d4f7-4a34-ab90-2e3f1ad62eed",
@@ -388,19 +417,43 @@
     // Sign app if JIT-less is set up
         NSURL *appPathURL = [NSURL fileURLWithPath:appPath];
             void (^signCompletionHandler)(BOOL success, NSError *error)  = ^(BOOL success, NSError *_Nullable error) {
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    [NSUserDefaults.standardUserDefaults removeObjectForKey:@"SigningInProgress"];
-                    if(!success) {
+                if(!success) {
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        [NSUserDefaults.standardUserDefaults removeObjectForKey:@"SigningInProgress"];
                         completetionHandler(NO, error.localizedDescription);
-                    } else {
-                        bool signatureValid = checkCodeSignature(executablePath.UTF8String);
+                    });
+                    return;
+                }
+                // Verification can copy the executable, which for a large app is far
+                // too slow to run on the main thread. This block is not guaranteed to
+                // arrive on a background queue, so move there explicitly.
+                dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+                    NSString* signatureError = nil;
+                    bool signatureValid = checkCodeSignatureWithError(executablePath.UTF8String, &signatureError);
+                    if(!signatureValid) {
+                        // Usually the kernel serving a signature blob it cached
+                        // against the old inode rather than anything wrong with
+                        // what zsign just wrote. Force a fresh inode and ask
+                        // again before we refuse to launch a working app.
+                        NSLog(@"[LC] post-sign signature check failed for %@: %@ - refreshing inode and retrying", executablePath, signatureError);
+                        NSError* refreshError = nil;
+                        if(LCRefreshFileInode(executablePath, &refreshError)) {
+                            signatureValid = checkCodeSignatureWithError(executablePath.UTF8String, &signatureError);
+                        } else {
+                            NSLog(@"[LC] failed to refresh %@: %@", executablePath, refreshError);
+                        }
+                        if(!signatureValid) {
+                            NSLog(@"[LC] signature still invalid after refresh for %@: %@", executablePath, signatureError);
+                        }
+                    }
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        [NSUserDefaults.standardUserDefaults removeObjectForKey:@"SigningInProgress"];
                         if(signatureValid) {
                             completetionHandler(YES, [error localizedDescription]);
                         } else {
                             completetionHandler(NO, @"lc.signer.latestCertificateInvalidErr");
                         }
-                    }
-                    
+                    });
                 });
             };
             

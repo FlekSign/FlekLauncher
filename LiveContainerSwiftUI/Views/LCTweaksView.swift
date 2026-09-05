@@ -97,7 +97,7 @@ struct LCTweakFolderView : View {
                                 Label(tweakItem.displayName, systemImage: "building.columns.fill")
                                 Spacer()
                             } else {
-                                Label(tweakItem.displayName, systemImage: "document.fill")
+                                Label(tweakItem.displayName, systemImage: FlekSymbol.document)
                                 Spacer()
                             }
                         }
@@ -139,8 +139,11 @@ struct LCTweakFolderView : View {
                 }
             }
         }
-        .navigationTitle(isRoot ? "lc.tabView.tweaks".loc : baseUrl.lastPathComponent)
+        .navigationBarTitleDisplayMode(.inline)
         .toolbar {
+            ToolbarItem(placement: .principal) {
+                Text(isRoot ? "lc.tabView.tweaks".loc : baseUrl.lastPathComponent).font(.headline)
+            }
             ToolbarItem(placement: .topBarTrailing) {
                 if !isTweakSigning && LCSharedUtils.certificatePassword() != nil {
                     Button {
@@ -393,10 +396,10 @@ struct LCTweakFolderView : View {
 
 struct LCTweaksView: View {
     var body: some View {
-        NavigationView {
-            LCTweakFolderView(baseUrl: LCPath.tweakPath, isRoot: true)
-        }
-        .navigationViewStyle(StackNavigationViewStyle())
-
+        // Rendered inside the Settings navigation stack (pushed via NavigationLink),
+        // so it must not introduce its own NavigationView — otherwise the "Tweaks"
+        // principal title lands in a nested nav bar instead of the shared one used
+        // by the other Settings sections.
+        LCTweakFolderView(baseUrl: LCPath.tweakPath, isRoot: true)
     }
 }

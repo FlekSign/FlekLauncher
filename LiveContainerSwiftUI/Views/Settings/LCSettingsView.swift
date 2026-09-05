@@ -22,9 +22,9 @@ enum JITEnablerType : Int, CaseIterable, Identifiable {
     var displayName: String {
         switch self {
         case .StikJIT: "StikDebug"
-        case .StikJITLC: "StikDebug (Another LiveContainer/Multitask)"
+        case .StikJITLC: "StikDebug (Another FlekDeck)"
         case .StosDebug: "StosDebug"
-        case .StosDebugLC: "StosDebug (Another LiveContainer/Multitask)"
+        case .StosDebugLC: "StosDebug (Another FlekDeck)"
         case .SideStore: "SideStore"
         case .JITStreamerEBLegacy: "JitStreamer-EB (Relaunch)"
         case .SideJITServer: "SideJITServer/JITStreamer 2.0"
@@ -37,7 +37,11 @@ struct LCSettingsView: View {
     @State var errorInfo = ""
     @State var successShow = false
     @State var successInfo = ""
-
+    
+    
+    
+    
+    @StateObject private var installLC2Alert = AlertHelper<Int>()
     @State private var certificateDataFound = false
     
     @StateObject private var certificateImportAlert = YesNoHelper()
@@ -50,9 +54,28 @@ struct LCSettingsView: View {
     @AppStorage("LCSwitchAppWithoutAsking") var silentSwitchApp = false
     @AppStorage("LCOpenWebPageWithoutAsking") var silentOpenWebPage = false
     @AppStorage("LCDontSignApp", store: LCUtils.appGroupUserDefault) var dontSignApp = false
+    @AppStorage("LCCustomBundleIdEnabled", store: LCUtils.appGroupUserDefault) var customBundleIdEnabled = false
     @AppStorage("LCStrictHiding", store: LCUtils.appGroupUserDefault) var strictHiding = false
     @AppStorage("dynamicColors", store: LCUtils.appGroupUserDefault) var dynamicColors = true
     @AppStorage("darkModeIcon", store: LCUtils.appGroupUserDefault) var darkModeIcon = false
+    
+    @AppStorage("LCMultitaskMode", store: LCUtils.appGroupUserDefault) var multitaskMode: MultitaskMode = .virtualWindow
+    @AppStorage("LCLaunchInMultitaskMode") var launchInMultitaskMode = true
+    @AppStorage("LCLaunchMultitaskMaximized") var launchMultitaskMaximized = false
+    // Multitask switcher bar: rounded (tall, concave corners) when on, flat short bar when off.
+    // Bar rounding amount, 0 (flat) … 100 (fully rounded concave corners).
+    @AppStorage("LCMultitaskBarLedgeAmount", store: LCUtils.appGroupUserDefault) var barLedgeAmount: Double = 60
+    // Multitask control haptics: 0 (off) … 3 (strongest). Read back through
+    // MultitaskDockManager, which also carries over the on/off switch this
+    // slider replaced.
+    @AppStorage("LCMultitaskHapticsLevel", store: LCUtils.appGroupUserDefault) var multitaskHapticsLevel = 1
+    @AppStorage("LCAutoEndPiP", store: LCUtils.appGroupUserDefault) var autoEndPiP = false
+    @AppStorage("LCSkipTerminatedScreen", store: LCUtils.appGroupUserDefault) var skipTerminatedScreen = true
+    @AppStorage("LCRestartTerminatedApp", store: LCUtils.appGroupUserDefault) var restartTerminatedApp = true
+    @AppStorage("LCMaxOneAppOnStage", store: LCUtils.appGroupUserDefault) var onlyOneAppOnStage = false
+    @AppStorage("LCRedirectURLToHost", store: LCUtils.appGroupUserDefault) var redirectURLToHost = false
+    @AppStorage("LCShowRotationPanel", store: LCUtils.appGroupUserDefault) var showRotationPanel = false
+    @AppStorage("LCMultitaskHomeBar", store: LCUtils.appGroupUserDefault) var usesBottomSwipe = true
     
     @AppStorage("LCSideJITServerAddress", store: LCUtils.appGroupUserDefault) var sideJITServerAddress : String = ""
     @AppStorage("LCDeviceUDID", store: LCUtils.appGroupUserDefault) var deviceUDID: String = ""
@@ -70,6 +93,8 @@ struct LCSettingsView: View {
     @AppStorage("LCSharePrivateDataWithLiveProcess") var sharePrivateDataWithLiveProcess = false
     @AppStorage("BKNoWatchdogs") var disableLiveProcessWatchdog = false
     
+    @AppStorage("LCBetaBannerOverride", store: LCUtils.appGroupUserDefault) private var betaBannerOverride: Int = 0
+
     @EnvironmentObject private var sharedModel : SharedModel
     
     @State private var isViewAppeared = false
@@ -81,237 +106,166 @@ struct LCSettingsView: View {
         _store = State(initialValue: LCUtils.store())
     }
     
+    /// Name of the step the haptics slider currently sits on, shown beside it —
+    /// a strength is easier to recognise by name than by a bare number, and the
+    /// left end being "Off" is the part worth being explicit about.
+    private var multitaskHapticsLevelName: String {
+        switch multitaskHapticsLevel {
+        case 1: return "lc.flek.haptics.light".loc
+        case 2: return "lc.flek.haptics.medium".loc
+        case 3: return "lc.flek.haptics.strong".loc
+        default: return "lc.flek.haptics.off".loc
+        }
+    }
+
+    /// The slider's Double seen as the stored whole step, playing each new step's
+    /// feedback as it is reached: the setting is about how something feels, so it
+    /// has to be felt while it is being set. Silent at the off end, and silent
+    /// while a drag stays within one step.
+    private var multitaskHapticsBinding: Binding<Double> {
+        Binding(
+            get: { Double(multitaskHapticsLevel) },
+            set: { newValue in
+                let level = min(max(Int(newValue.rounded()), 0), 3)
+                guard level != multitaskHapticsLevel else { return }
+                multitaskHapticsLevel = level
+                if #available(iOS 16.0, *) {
+                    MultitaskDockManager.playHaptic(level: level)
+                }
+            }
+        )
+    }
+
     var body: some View {
         NavigationView {
             Form {
-                if sharedModel.multiLCStatus != 2 {
-                    Section{
-                        if !certificateDataFound {
-                            Button {
-                                Task{ await importCertificate() }
-                            } label: {
-                                Text("lc.settings.importCertificate".loc)
-                            }
-                        } else {
-                            Button {
-                                Task{ await removeCertificate() }
-                            } label: {
-                                Text("lc.settings.removeCertificate".loc)
-                            }
+                // MARK: - Certificate (shown only when no certificate is detected)
+                if sharedModel.multiLCStatus != 2 && !certificateDataFound {
+                    Section {
+                        Button("lc.settings.importCertificate".loc) {
+                            Task { await importCertificate() }
                         }
-                        if store == .AltStore || store == .SideStore {
-                            Button {
-                                Task{ await importCertificateFromSideStore() }
-                            } label: {
-                                if certificateDataFound {
-                                    Text("lc.settings.refreshCertificateFromStore %@".localizeWithFormat(storeName))
-                                } else {
-                                    Text("lc.settings.importCertificateFromStore %@".localizeWithFormat(storeName))
-                                }
-                            }
-                        }
-                        
-                        NavigationLink {
-                            LCJITLessDiagnoseView()
-                        } label: {
-                            Text("lc.settings.jitlessDiagnose".loc)
-                        }
-
                     } header: {
                         Text("lc.settings.jitLess".loc)
                     } footer: {
                         Text("lc.settings.jitLessDesc".loc)
                     }
                 }
-                if (store != .Unknown && store != .ADP) || LCUtils.isAppGroupAltStoreLike() {
-                    Section{
-                        NavigationLink {
-                            LCMultiLCManagementView()
-                        } label: {
-                            if sharedModel.multiLCStatus == 0 {
-                                Text("lc.settings.multiLC".loc)
-                            } else if sharedModel.multiLCStatus == 2 {
-                                Text("lc.settings.multiLCIsSecond".loc)
-                            }
-                            
-                        }
-                        .disabled(sharedModel.multiLCStatus == 2)
-                        
-                        if(sharedModel.multiLCStatus == 2) {
-                            NavigationLink {
-                                LCJITLessDiagnoseView()
-                            } label: {
-                                Text("lc.settings.jitlessDiagnose".loc)
-                            }
-                        }
-                    } footer: {
-                        Text("lc.settings.multiLCDesc".loc)
-                    }
-                }
-                
-                if #available(iOS 16.1, *) {
-                    Section {
-                        NavigationLink {
-                            LCMultitaskSettingView()
-                        } label: {
-                            Text("lc.appBanner.multitask".loc)
-                        }
-                    } footer: {
-                        Text("lc.settings.multitaskDesc".loc)
-                    }
-                }
-                
+                // MARK: - Categories
                 Section {
-                    if JITEnabler == .SideJITServer || JITEnabler == .JITStreamerEBLegacy {
-                        HStack {
-                            Text("lc.settings.JitAddress".loc)
-                            Spacer()
-                            TextField(JITEnabler == .SideJITServer ? "http://x.x.x.x:8080" : "http://[fd00::]:9172", text: $sideJITServerAddress)
-                                .multilineTextAlignment(.trailing)
+                    NavigationLink { FlekPersonalizationView() } label: {
+                        categoryRow("lc.flek.personalization".loc, "paintbrush.fill", .purple)
+                    }
+                    NavigationLink { launchBehaviorPage } label: {
+                        categoryRow("lc.flek.cat.launch".loc, FlekSymbol.appGrid, .blue, iconSize: 22)
+                    }
+                    if #available(iOS 16.1, *) {
+                        NavigationLink { multitaskPage } label: {
+                            categoryRow("lc.flek.cat.multitask".loc, "macwindow.on.rectangle", .green)
                         }
                     }
-                    if JITEnabler == .SideJITServer {
-                        HStack {
-                            Text("lc.settings.JitUDID".loc)
-                            Spacer()
-                            TextField("", text: $deviceUDID)
-                                .multilineTextAlignment(.trailing)
-                        }
+                    NavigationLink { jitPage } label: {
+                        categoryRow("lc.flek.cat.jit".loc, "j.circle", .blue, iconSize: 20)
                     }
-                    Picker(selection: $JITEnabler) {
-                        ForEach(JITEnablerType.allCases) { enablerType in
-                            Text(enablerType.displayName).tag(enablerType)
-                        }
-                    } label: {
-                        Text("lc.settings.jitEnabler".loc)
+                    NavigationLink { contentRestrictionsPage } label: {
+                        categoryRow("lc.flek.cat.content".loc, "nosign", .red, iconSize: 20)
                     }
-
-                } header: {
-                    Text("JIT")
-                } footer: {
-                    Text("lc.settings.JitDesc".loc)
+                    NavigationLink { signingPage } label: {
+                        categoryRow("lc.flek.cat.signing".loc, "signature", .mint, iconSize: 15)
+                    }
+                    NavigationLink { LCTweaksView() } label: {
+                        categoryRow("Tweaks", "wrench.and.screwdriver.fill", .orange, iconSize: 17)
+                    }
                 }
-                
-                Section{
-                    Toggle(isOn: $dynamicColors) {
-                        Text("lc.settings.dynamicColors".loc)
-                    }
-                    if #available(iOS 18.0, *) {
-                        Toggle(isOn: $darkModeIcon) {
-                            Text("lc.settings.darkModeIcon".loc)
-                        }
-                    }
-                    
-                } header: {
-                    Text("lc.settings.interface".loc)
-                } footer: {
-                    Text("lc.settings.dynamicColors.desc".loc)
-                }
-                Section{
-                    Toggle(isOn: $frameShortIcon) {
-                        Text("lc.settings.FrameIcon".loc)
-                    }
-                } header: {
-                    Text("lc.common.miscellaneous".loc)
-                } footer: {
-                    Text("lc.settings.FrameIconDesc".loc)
-                }
-                
                 Section {
-                    Toggle(isOn: $silentSwitchApp) {
-                        Text("lc.settings.silentSwitchApp".loc)
-                    }
-                } footer: {
-                    Text("lc.settings.silentSwitchAppDesc".loc)
-                }
-                
-                Section {
-                    Toggle(isOn: $silentOpenWebPage) {
-                        Text("lc.settings.silentOpenWebPage".loc)
-                    }
-                } footer: {
-                    Text("lc.settings.silentOpenWebPageDesc".loc)
-                }
-                
-                if sharedModel.isHiddenAppUnlocked {
-                    Section {
-                        Toggle(isOn: $strictHiding) {
-                            Text("lc.settings.strictHiding".loc)
-                        }
-                    } footer: {
-                        Text("lc.settings.strictHidingDesc".loc)
-                    }
-                }
-                
-                Section {
-                    Toggle(isOn: $dontSignApp) {
-                        Text("lc.settings.dontSign".loc)
-                    }
-                } footer: {
-                    Text("lc.settings.dontSignDesc".loc)
-                }
-
-                Section {
-                    Button {
-                        clearNotifications()
-                    } label: {
-                        Text("lc.settings.clearNotifications".loc)
-                    }
-                }
-
-                Section {
-                    if sharedModel.multiLCStatus != 2 {
-                        NavigationLink {
-                            LCStorageManagementView()
-                        } label: {
-                            Text("lc.settings.storageManagement".loc)
-                        }
-                    }
-                    NavigationLink {
-                        LCDataManagementView()
-                    } label: {
-                        Text("lc.settings.dataManagement".loc)
-                    }
-                }
-                
-                Section {
-                    HStack {
-                        Image("GitHub")
-                        Button("LiveContainer/LiveContainer") {
-                            openGitHub()
-                        }
-                    }
-                    HStack {
-                        Image("Twitter")
-                        Button("khanhduytran0") {
-                            openTwitter()
-                        }
-                    }
-                    HStack {
-                        Image("GitHub")
-                        Button("Huge_Black") {
-                            openGitHub2()
-                        }
-                    }
-                } header: {
-                    Text("lc.settings.about".loc)
+                    linkRow("FleksignIcon", "FlekSign.com", action: openFleksign)
+                    linkRow("GitHub", "GitHub - LiveContainer", action: openGitHub)
+                    linkRow("Twitter", "khanhduytran0", action: openTwitter)
+                    linkRow("GitHub", "GitHub - Huge_Black", action: openGitHub2)
                 } footer: {
                     Text("lc.settings.warning".loc)
                 }
                 
-                VStack{
+                VStack(alignment: .leading, spacing: 2){
                     Text(LCUtils.getVersionInfo())
                         .foregroundStyle(.gray)
+                        // The branch and hash make this long enough to wrap in the
+                        // width the padding below leaves it. Two lines to wrap into,
+                        // and shrinking only once that is not enough either.
+                        .lineLimit(2)
+                        .minimumScaleFactor(0.5)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(Rectangle())
                         .onTapGesture(count: 5) {
                             sharedModel.developerMode = true
                         }
+                    
+                    HStack(spacing:0){
+                        Text("Build: ")
+                            .foregroundStyle(.gray)
+                        // A Link here would take over the whole Form row and swallow
+                        // the version tap above it, so open the URL by hand instead.
+                        Text("FlekSign")
+                            .foregroundStyle(.blue)
+                            .contentShape(Rectangle())
+                            .onTapGesture(perform: openFleksign)
+                    }
+                    // Centred on its own, against a version line that fills the width
+                    // to sit leading. The stack's own alignment cannot do both.
+                    .frame(maxWidth: .infinity)
+                    // The size this line has always been. Only the version below the
+                    // footer was meant to match it, and a font set here is nearer the
+                    // text than the one on the stack, so it is the one that lands.
+                    .font(.body)
+                    
                 }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
-                    .background(Color(UIColor.systemGroupedBackground))
-                    .listRowInsets(EdgeInsets())
-                
+                .font(.footnote)
+                // Line up with the footer above rather than with the cards: a row is
+                // kept 20pt clear of each window edge, and a section footer a further
+                // 20pt inside that. Leading, for the same reason — a matching margin
+                // reads as one only if both start at the same edge. The padding sits
+                // within the frame so the background still covers the whole row —
+                // inset the row itself and the cell's own card colour shows along
+                // both edges.
+                .padding(.horizontal, 20)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+                .background(Color(UIColor.systemGroupedBackground))
+                .listRowInsets(EdgeInsets())
+
+                if isBetaiOS {
+                    Section {
+                        HStack(spacing: 10) {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .foregroundStyle(.red)
+                                .font(.title3)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("iOS Beta Detected")
+                                    .font(.subheadline.bold())
+                                    .foregroundStyle(.red)
+                                Text("Beta versions of iOS may cause certificate revocation. Apps and features may not work correctly. Please roll back to the stable release version.")
+                                    .font(.caption)
+                                    .foregroundStyle(.red.opacity(0.8))
+                            }
+                        }
+                        .padding(.vertical, 4)
+                    }
+                }
+
                 if sharedModel.developerMode {
                     Section {
+                        if #available(iOS 16.1, *) {
+                            Toggle(isOn: $showRotationPanel) {
+                                Text("lc.settings.rotationOverlay".loc)
+                            }
+                            .onChange(of: showRotationPanel) { on in
+                                // The overlay always runs; this only draws it. If
+                                // the panel is being taken away, drop any manual
+                                // lock with it, so a lock cannot outlive the only
+                                // control that releases it.
+                                if !on { LCRotationLock.isManual = false }
+                                LCRotationLockOverlay.setPanelVisible(on)
+                            }
+                        }
                         Toggle(isOn: $injectToLCItelf) {
                             Text("lc.settings.injectLCItself".loc)
                         }
@@ -329,11 +283,6 @@ struct LCSettingsView: View {
                         }
                         Toggle(isOn: $disableLiveProcessWatchdog) {
                             Text("Disable LiveProcess watchdog termination")
-                        }
-                        Button {
-                            export()
-                        } label: {
-                            Text("Export Cert")
                         }
                         Button {
                             exportDyld()
@@ -355,12 +304,6 @@ struct LCSettingsView: View {
                         } label: {
                             Text("Reset Symbol Offsets")
                         }
-                        Button {
-                            presentFLEXOverlay()
-                        } label: {
-                            Text("Show FLEX Overlay")
-                        }
-                        .disabled(NSClassFromString("FLEXManager") == nil)
                         #if is32BitSupported
                         HStack {
                             Text("LiveExec32 .app path")
@@ -376,7 +319,8 @@ struct LCSettingsView: View {
                     }
                 }
             }
-            .navigationBarTitle("lc.tabView.settings".loc)
+            .navigationTitle("lc.tabView.settings".loc)
+            .navigationBarTitleDisplayMode(.large)
             .alert("lc.common.error".loc, isPresented: $errorShow){
             } message: {
                 Text(errorInfo)
@@ -391,7 +335,7 @@ struct LCSettingsView: View {
                 } label: {
                     Text("lc.common.ok".loc)
                 }
-
+                
                 Button("lc.common.cancel".loc, role: .cancel) {
                     certificateImportAlert.close(result: false)
                 }
@@ -404,7 +348,7 @@ struct LCSettingsView: View {
                 } label: {
                     Text("lc.common.ok".loc)
                 }
-
+                
                 Button("lc.common.cancel".loc, role: .cancel) {
                     certificateRemoveAlert.close(result: false)
                 }
@@ -442,8 +386,7 @@ struct LCSettingsView: View {
                 }
             )
         }
-        .navigationViewStyle(StackNavigationViewStyle())
-        .onAppear() {
+        .onAppear {
             if !isViewAppeared {
                 guard sharedModel.selectedTab == .settings, let link = sharedModel.deepLink else { return }
                 sharedModel.deepLink = nil
@@ -451,13 +394,354 @@ struct LCSettingsView: View {
                 isViewAppeared = true
             }
         }
+        .navigationViewStyle(StackNavigationViewStyle())
         .onChange(of: sharedModel.deepLink) { link in
             guard sharedModel.selectedTab == .settings, let link else { return }
             sharedModel.deepLink = nil
             handleURL(url: link)
         }
     }
+
+    private var isBetaiOS: Bool {
+        guard let buildVersion = UIDevice.current.buildVersion,
+              let lastChar = buildVersion.last else { return false }
+        return lastChar.isLowercase
+    }
+
+    /// An external-link row. The artwork is already a full-bleed tile, so it's sized
+    /// and clipped to the same 30pt rounded square as the category icons rather than
+    /// drawn at its native size, which is far larger than a row.
+    @ViewBuilder
+    private func linkRow(_ imageName: String, _ title: String, action: @escaping () -> Void) -> some View {
+        // These open URLs rather than pushing a view, so there's no NavigationLink to
+        // supply a disclosure indicator — it's drawn by hand to match the category
+        // rows above. `.plain` keeps the title in the label colour like those rows
+        // (a bare Button would tint it), and the content shape makes the whole row
+        // tappable rather than just the text.
+        Button(action: action) {
+            HStack(spacing: 10) {
+                Image(imageName)
+                    .resizable()
+                    .scaledToFill()
+                    .frame(width: 30, height: 30)
+                    .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+                Text(title)
+                Spacer(minLength: 8)
+                Image(systemName: "chevron.forward")
+                    .font(.footnote.weight(.semibold))
+                    .foregroundStyle(Color(UIColor.tertiaryLabel))
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    /// `iconSize` is per-symbol on purpose. Point size sets the em, not the drawn
+    /// shape, and how much of that em a symbol inks varies by design — an enclosed
+    /// glyph like `j.circle` or a thin one like `app.grid` reads far smaller than a
+    /// `.fill` symbol at the same size. The default suits most of the set; the
+    /// densest symbols pass a smaller value rather than everything sharing one size
+    /// and half the rows looking undersized.
+    @ViewBuilder
+    private func categoryRow(_ title: String, _ systemImage: String, _ color: Color,
+                             iconSize: CGFloat = 17) -> some View {
+        // Laid out by hand rather than with `Label`: its icon-to-title gap is fixed
+        // and too wide for a tile this size, and it can't be tightened otherwise.
+        let tile = RoundedRectangle(cornerRadius: 7, style: .continuous)
+        HStack(spacing: 10) {
+            Image(systemName: systemImage)
+                .font(.system(size: iconSize, weight: .regular))
+                .foregroundStyle(.white)
+                .frame(width: 30, height: 30)
+                .background(
+                    tile.fill(color)
+                        // Sheen over the colour, brightest at the top and gone by the
+                        // bottom. Drawn in the same shape as the fill so it needs no
+                        // clipping, and it sits in the background so the white glyph
+                        // stays on top of it.
+                        .overlay(
+                            tile.fill(
+                                LinearGradient(
+                                    colors: [Color.white.opacity(0.45), Color.white.opacity(0)],
+                                    startPoint: .top,
+                                    endPoint: .bottom
+                                )
+                            )
+                        )
+                )
+            Text(title)
+        }
+    }
+
+    @ViewBuilder private var launchBehaviorPage: some View {
+        Form {
+                Section {
+                    Toggle(isOn: $silentSwitchApp) {
+                        Text("lc.settings.silentSwitchApp".loc)
+                    }
+                } footer: {
+                    Text("lc.settings.silentSwitchAppDesc".loc)
+                }
+                
+                Section {
+                    Toggle(isOn: $silentOpenWebPage) {
+                        Text("lc.settings.silentOpenWebPage".loc)
+                    }
+                } footer: {
+                    Text("lc.settings.silentOpenWebPageDesc".loc)
+                }
+                
+        }
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar { ToolbarItem(placement: .principal) { Text("lc.flek.cat.launch".loc).font(.headline) } }
+    }
+
+    @ViewBuilder private var multitaskPage: some View {
+        Form {
+                if #available(iOS 16.1, *) {
+                    Section {
+                        if(UIApplication.shared.supportsMultipleScenes) {
+                            Picker(selection: $multitaskMode) {
+                                Text("lc.settings.multitaskMode.virtualWindow".loc).tag(MultitaskMode.virtualWindow)
+                                Text("lc.settings.multitaskMode.nativeWindow".loc).tag(MultitaskMode.nativeWindow)
+                            } label: {
+                                Text("lc.settings.multitaskMode".loc)
+                            }
+                        }
+                        Toggle(isOn: $launchInMultitaskMode) {
+                            Text("lc.settings.autoLaunchInMultitaskMode".loc)
+                        }
+                        
+                        if multitaskMode == .virtualWindow {
+                            Toggle(isOn: $launchMultitaskMaximized) {
+                                Text("lc.settings.launchMultitaskMaximized".loc)
+                            }
+                            if launchMultitaskMaximized {
+                                Toggle(isOn: $onlyOneAppOnStage) {
+                                    Text("lc.settings.onlyOneAppOnStage".loc)
+                                }
+                            }
+                            Toggle(isOn: $autoEndPiP) {
+                                Text("lc.settings.autoEndPiP".loc)
+                            }
+                            Toggle(isOn: $skipTerminatedScreen) {
+                                Text("lc.settings.skipTerminatedScreen".loc)
+                            }
+                            if skipTerminatedScreen {
+                                Toggle(isOn: $restartTerminatedApp) {
+                                    Text("lc.settings.restartTerminatedApp".loc)
+                                }
+                            }
+                            Toggle(isOn: $redirectURLToHost) {
+                                Text("lc.settings.redirectURLToHost".loc)
+                            }
+                            VStack(alignment: .leading, spacing: 12) {
+                                HStack {
+                                    Text("lc.flek.switcherHaptics".loc)
+                                        .foregroundColor(.primary)
+                                    Spacer()
+                                    Text(multitaskHapticsLevelName)
+                                        .foregroundColor(.secondary)
+                                        .font(.caption)
+                                }
+                                // Four stops, off at the left end. Every stop plays
+                                // its own feedback as it is reached, so the strength
+                                // is chosen by feel rather than by name.
+                                Slider(value: multitaskHapticsBinding,
+                                       in: 0...3, step: 1) {
+                                    Text("lc.flek.switcherHaptics".loc)
+                                }
+                                .tint(.accentColor)
+                            }
+                            .padding(.vertical, 4)
+                            Picker(selection: $usesBottomSwipe) {
+                                Text("lc.flek.multitaskControl.assistiveTouch".loc).tag(false)
+                                Text("lc.flek.multitaskControl.bottomSwipe".loc).tag(true)
+                            } label: {
+                                Text("lc.flek.multitaskControl".loc)
+                            }
+                            .onChange(of: usesBottomSwipe) { _ in
+                                NotificationCenter.default.post(
+                                    name: NSNotification.Name("MultitaskHomeBarSettingChanged"),
+                                    object: nil)
+                            }
+                            VStack(alignment: .leading, spacing: 12) {
+                                HStack {
+                                    Text("lc.flek.roundedSwitcherBar".loc)
+                                        .foregroundColor(.primary)
+                                    Spacer()
+                                    Text("\(Int(barLedgeAmount))%")
+                                        .foregroundColor(.secondary)
+                                        .font(.caption)
+                                }
+                                // 0% = flat bar, 100% = fully rounded concave corners,
+                                // in 10% steps.
+                                Slider(value: $barLedgeAmount, in: 0...100, step: 10) {
+                                    Text("lc.flek.roundedSwitcherBar".loc)
+                                }
+                                .tint(.accentColor)
+                                .onChange(of: barLedgeAmount) { _ in
+                                    NotificationCenter.default.post(
+                                        name: NSNotification.Name("MultitaskBarDesignChanged"),
+                                        object: nil)
+                                }
+                            }
+                            .padding(.vertical, 4)
+                        }
+                    } footer: {
+                        Text("lc.settings.multitaskDesc".loc)
+                    }
+                }
+                
+        }
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar { ToolbarItem(placement: .principal) { Text("lc.flek.cat.multitask".loc).font(.headline) } }
+    }
+
+    @ViewBuilder private var jitPage: some View {
+        Form {
+                if sharedModel.multiLCStatus != 2 {
+                    Section {
+                        if !certificateDataFound {
+                            Button("lc.settings.importCertificate".loc) {
+                                Task { await importCertificate() }
+                            }
+                        } else {
+                            Button("lc.settings.removeCertificate".loc) {
+                                Task { await removeCertificate() }
+                            }
+                        }
+                        
+                        NavigationLink {
+                            LCJITLessDiagnoseView()
+                        } label: {
+                            Text("lc.settings.jitlessDiagnose".loc)
+                        }
+                    } header: {
+                        Text("lc.settings.jitLess".loc)
+                    } footer: {
+                        Text("lc.settings.jitLessDesc".loc)
+                    }
+                }
+                Section {
+                    if JITEnabler == .SideJITServer || JITEnabler == .JITStreamerEBLegacy {
+                        HStack {
+                            Text("lc.settings.JitAddress".loc)
+                            Spacer()
+                            TextField(JITEnabler == .SideJITServer ? "http://x.x.x.x:8080" : "http://[fd00::]:9172", text: $sideJITServerAddress)
+                                .multilineTextAlignment(.trailing)
+                        }
+                    }
+                    if JITEnabler == .SideJITServer {
+                        HStack {
+                            Text("lc.settings.JitUDID".loc)
+                            Spacer()
+                            TextField("", text: $deviceUDID)
+                                .multilineTextAlignment(.trailing)
+                        }
+                    }
+                    Picker(selection: $JITEnabler) {
+                        Text("SideJITServer/JITStreamer 2.0").tag(JITEnablerType.SideJITServer)
+                        Text("StikDebug").tag(JITEnablerType.StikJIT)
+                        Text("StikDebug (Another FlekDeck)").tag(JITEnablerType.StikJITLC)
+                        Text("SideStore").tag(JITEnablerType.SideStore)
+                        Text("JitStreamer-EB (Relaunch)").tag(JITEnablerType.JITStreamerEBLegacy)
+                    } label: {
+                        Text("lc.settings.jitEnabler".loc)
+                    }
+                    
+                } header: {
+                    Text("JIT")
+                } footer: {
+                    Text("lc.settings.JitDesc".loc)
+                }
+                
+                
+        }
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar { ToolbarItem(placement: .principal) { Text("lc.flek.cat.jit".loc).font(.headline) } }
+    }
+
+    @ViewBuilder private var contentRestrictionsPage: some View {
+        Form {
+                if sharedModel.isHiddenAppUnlocked {
+                    Section {
+                        Toggle(isOn: $strictHiding) {
+                            Text("lc.settings.strictHiding".loc)
+                        }
+                    } footer: {
+                        Text("lc.settings.strictHidingDesc".loc)
+                    }
+                }
+                
+        }
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar { ToolbarItem(placement: .principal) { Text("lc.flek.cat.content".loc).font(.headline) } }
+    }
+
+    @ViewBuilder private var signingPage: some View {
+        Form {
+                Section {
+                    Toggle(isOn: $dontSignApp) {
+                        Text("lc.settings.dontSign".loc)
+                    }
+                } footer: {
+                    Text("lc.settings.dontSignDesc".loc)
+                }
+                
+                Section {
+                    Toggle(isOn: $customBundleIdEnabled) {
+                        Text("lc.settings.customBundleId".loc)
+                    }
+                } footer: {
+                    Text("lc.settings.customBundleIdDesc".loc)
+                }
+                
+                Section {
+                    NavigationLink {
+                        LCDataManagementView()
+                    } label: {
+                        Text("lc.settings.dataManagement".loc)
+                    }
+                }
+                
+                if (store != .Unknown && store != .ADP) || LCUtils.isAppGroupAltStoreLike() {
+                    Section{
+                        NavigationLink {
+                            LCMultiLCManagementView()
+                        } label: {
+                            if sharedModel.multiLCStatus == 0 {
+                                Text("lc.settings.multiLCInstall".loc)
+                            } else if sharedModel.multiLCStatus == 2 {
+                                Text("lc.settings.multiLCIsSecond".loc)
+                            }
+                            
+                        }
+                        .disabled(sharedModel.multiLCStatus == 2)
+                        
+                        if(sharedModel.multiLCStatus == 2) {
+                            NavigationLink {
+                                LCJITLessDiagnoseView()
+                            } label: {
+                                Text("lc.settings.jitlessDiagnose".loc)
+                            }
+                        }
+                    } header: {
+                        Text("lc.settings.multiLC".loc)
+                    } footer: {
+                        Text("lc.settings.multiLCDesc".loc)
+                    }
+                }
+        }
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar { ToolbarItem(placement: .principal) { Text("lc.flek.cat.signing".loc).font(.headline) } }
+    }
+
     
+    func openFleksign() {
+        UIApplication.shared.open(URL(string: "https://fleksign.com")!)
+    }
+
     func openGitHub() {
         UIApplication.shared.open(URL(string: "https://github.com/LiveContainer/LiveContainer")!)
     }
@@ -467,7 +751,7 @@ struct LCSettingsView: View {
     }
     
     func openTwitter() {
-        UIApplication.shared.open(URL(string: "https://twitter.com/khanhduytran0")!)
+        UIApplication.shared.open(URL(string: "https://x.com/khanhduytran0")!)
     }
 
     func clearNotifications() {
@@ -481,50 +765,6 @@ struct LCSettingsView: View {
         }
     }
 
-    func export() {
-        let fileManager = FileManager.default
-        let documentsURL = fileManager.urls(for: .documentDirectory, in: .userDomainMask).first!
-        
-        // 1. Copy embedded.mobileprovision from the main bundle to Documents
-        if let embeddedURL = Bundle.main.url(forResource: "embedded", withExtension: "mobileprovision") {
-            let destinationURL = documentsURL.appendingPathComponent("embedded.mobileprovision")
-            do {
-                try fileManager.copyItem(at: embeddedURL, to: destinationURL)
-                print("Successfully copied embedded.mobileprovision to Documents.")
-            } catch {
-                print("Error copying embedded.mobileprovision: \(error)")
-            }
-        } else {
-            print("embedded.mobileprovision not found in the main bundle.")
-        }
-        
-        // 2. Read "certData" from UserDefaults and save to cert.p12 in Documents
-        if let certData = LCUtils.certificateData() {
-            let certFileURL = documentsURL.appendingPathComponent("cert.p12")
-            do {
-                try certData.write(to: certFileURL)
-                print("Successfully wrote certData to cert.p12 in Documents.")
-            } catch {
-                print("Error writing certData to cert.p12: \(error)")
-            }
-        } else {
-            print("certData not found in UserDefaults.")
-        }
-        
-        // 3. Read "certPassword" from UserDefaults and save to pass.txt in Documents
-        if let certPassword = LCSharedUtils.certificatePassword() {
-            let passwordFileURL = documentsURL.appendingPathComponent("pass.txt")
-            do {
-                try certPassword.write(to: passwordFileURL, atomically: true, encoding: .utf8)
-                print("Successfully wrote certPassword to pass.txt in Documents.")
-            } catch {
-                print("Error writing certPassword to pass.txt: \(error)")
-            }
-        } else {
-            print("certPassword not found in UserDefaults.")
-        }
-    }
-    
     func exportMainBundle() {
         let url = Bundle.main.bundleURL
         let fileManager = FileManager.default
@@ -540,12 +780,6 @@ struct LCSettingsView: View {
     
     func resetSymbolOffsets() {
         LCUtils.appGroupUserDefault.removeObject(forKey: "symbolOffsetCache")
-    }
-    
-    func presentFLEXOverlay() {
-        let manager = (NSClassFromString("FLEXManager") as? NSObject.Type)?.perform(NSSelectorFromString("sharedManager"))
-            .takeUnretainedValue() as? NSObject
-        manager?.perform(NSSelectorFromString("showExplorer"))
     }
     
     func importCertificate() async {
@@ -572,7 +806,7 @@ struct LCSettingsView: View {
             errorShow = true
             return
         }
-
+        
         LCUtils.appGroupUserDefault.set(certificateData, forKey: "LCCertificateData")
         LCUtils.appGroupUserDefault.set(certificatePassword, forKey: "LCCertificatePassword")
         LCUtils.appGroupUserDefault.set(NSDate.now, forKey: "LCCertificateUpdateDate")
@@ -580,7 +814,7 @@ struct LCSettingsView: View {
 
         UserDefaults.standard.set(LCSharedUtils.appGroupID(), forKey: "LCAppGroupID")
     }
-    
+
     func importCertificateFromSideStore() async {
         if UserDefaults.sideStoreExist() {
             if let ans = await certificateImportFromBuiltInSideStoreAlert.open(), ans {
@@ -644,7 +878,7 @@ struct LCSettingsView: View {
             storeScheme = "sidestore"
         }
         
-        guard let url = URL(string: "\(storeScheme.lowercased())://certificate?callback_template=livecontainer%3A%2F%2Fcertificate%3Fcert%3D%24%28BASE64_CERT%29%26password%3D%24%28PASSWORD%29") else {
+        guard let url = URL(string: "\(storeScheme.lowercased())://certificate?callback_template=flekdeck%3A%2F%2Fcertificate%3Fcert%3D%24%28BASE64_CERT%29%26password%3D%24%28PASSWORD%29") else {
             errorInfo = "Failed to initialize certificate import URL."
             errorShow = true
             return
@@ -662,12 +896,12 @@ struct LCSettingsView: View {
         guard let doRemove = await certificateRemoveAlert.open(), doRemove else {
             return
         }
-
+        
         LCUtils.appGroupUserDefault.set(nil, forKey: "LCCertificateData")
         LCUtils.appGroupUserDefault.set(nil, forKey: "LCCertificatePassword")
         LCUtils.appGroupUserDefault.set(nil, forKey: "LCCertificateUpdateDate")
         certificateDataFound = false
-
+        
         UserDefaults.standard.set(nil, forKey: "LCAppGroupID")
     }
     

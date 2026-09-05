@@ -7,6 +7,7 @@
 
 import Foundation
 import SwiftUI
+import Kingfisher
 import UIKit
 import CryptoKit
 
@@ -991,7 +992,7 @@ private struct LCSourceAppBanner: View {
             HStack(alignment: .center, spacing: 12) {
                 SourceIconView(url: app.iconURL)
                     .frame(width: 60, height: 60)
-                    .clipShape(RoundedRectangle(cornerRadius: 12))
+                    .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
                 VStack(alignment: .leading, spacing: 6) {
                     HStack(spacing: 6) {
                         Text(app.name)
@@ -1053,18 +1054,12 @@ private struct SourceIconView: View {
     
     var body: some View {
         if let url {
-            AsyncImage(url: url) { phase in
-                switch phase {
-                case .empty:
-                    placeholder
-                case .success(let image):
-                    image.resizable().scaledToFill()
-                case .failure:
-                    placeholder
-                @unknown default:
-                    placeholder
-                }
-            }
+            KFImage(url)
+                .placeholder { placeholder }
+                .cacheOriginalImage()
+                .fade(duration: 0.15)
+                .resizable()
+                .scaledToFill()
         } else {
             placeholder
         }

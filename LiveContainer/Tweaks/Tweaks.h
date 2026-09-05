@@ -15,6 +15,8 @@ void NSFMGuestHooksInit(void);
 void NSURLSCGuestHooksInit(void);
 void initDead10ccFix(void);
 void IDFVHookInit(NSUUID* uuid);
+void LCHostIdentityInit(void);
+void LCAudioMuteInit(NSString* dataUUID);
 
 @interface NSBundle(LiveContainer)
 - (instancetype)initWithPathForMainBundle:(NSString *)path;

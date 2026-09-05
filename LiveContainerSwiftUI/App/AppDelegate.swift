@@ -3,7 +3,103 @@ import SwiftUI
 import Intents
 
 @objc class AppDelegate: UIResponder, UIApplicationDelegate {
-        
+    
+    /// Set to `.portrait` when the springboard is visible so that only the
+    /// home screen is locked to portrait while the rest of the app can rotate.
+    static var orientationLock: UIInterfaceOrientationMask = .allButUpsideDown
+
+    /// Puts the interface into `orientationLock`, turning the window when the
+    /// orientation it is currently in has just stopped being allowed.
+    ///
+    /// Narrowing the mask is not enough on its own. UIKit re-resolves orientation
+    /// off a device event, and leaving a landscape app for the springboard is not
+    /// one — the phone lies exactly where it was. Without an explicit request the
+    /// window keeps that landscape and the springboard, which has only a portrait
+    /// layout, is drawn sideways into it.
+    ///
+    /// Returns whether a turn was actually asked for, so a caller that must not draw
+    /// until the window has turned knows whether it has anything to wait for.
+    @discardableResult
+    static func applyOrientationLock() -> Bool {
+        applyOrientationLock(retriesLeft: 2)
+    }
+
+    @discardableResult
+    private static func applyOrientationLock(retriesLeft: Int) -> Bool {
+        guard #available(iOS 16.0, *) else { return false }
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        guard let scene = scenes.first(where: { $0.activationState == .foregroundActive })
+                ?? scenes.first else { return false }
+
+        // Every window in the scene, not just the key one. This app keeps overlay
+        // windows above its own — the multitask host, the rotation readout — and
+        // whichever of them happens to be key may have no root controller at all,
+        // in which case asking only the key window asks nobody.
+        for window in scene.windows {
+            window.rootViewController?.setNeedsUpdateOfSupportedInterfaceOrientations()
+        }
+
+        let current = mask(for: scene.interfaceOrientation)
+        guard !current.isEmpty, !orientationLock.contains(current) else { return false }
+
+        // The member of the mask the device is actually pointing at, where the mask
+        // allows more than one. Handing UIKit the whole set lets it choose, and on a
+        // landscape pair it can settle on the turn the user is not holding — which
+        // also silently undoes a caller that asked for a specific one a moment
+        // earlier, as the way back from the switcher does.
+        var requested = orientationLock
+        if let facing = interfaceOrientation(matchingDevice: UIDevice.current.orientation) {
+            let facingMask = mask(for: facing)
+            if !facingMask.isEmpty, orientationLock.contains(facingMask) {
+                requested = facingMask
+            }
+        }
+        scene.requestGeometryUpdate(.iOS(interfaceOrientations: requested)) { _ in
+            // Refusals are not exceptional here, and silence is the worst outcome.
+            //
+            // The request is validated against the supported set UIKit currently
+            // believes in, and `setNeedsUpdateOfSupportedInterfaceOrientations` above
+            // only marks that set for re-resolution — it does not re-resolve it. So a
+            // request made in the same turn of the run loop as the mask that permits
+            // it can be refused, and with no handler it was refused silently: nothing
+            // turned, nothing asked again, and whatever was waiting for the turn ran
+            // out its patience and drew itself the wrong way round.
+            //
+            // The next turn of the run loop is after that re-resolution. Bounded, and
+            // re-entrant through the front door so it re-reads the lock rather than
+            // repeating a stale one — by then the destination may have changed.
+            guard retriesLeft > 0 else { return }
+            DispatchQueue.main.async { _ = applyOrientationLock(retriesLeft: retriesLeft - 1) }
+        }
+        return true
+    }
+
+    /// The interface orientation a device reading corresponds to, or nil for face up,
+    /// face down and unknown, which describe the phone's relationship to the ground
+    /// rather than to the viewer and name no interface orientation at all.
+    static func interfaceOrientation(matchingDevice device: UIDeviceOrientation) -> UIInterfaceOrientation? {
+        switch device {
+        case .portrait: return .portrait
+        case .portraitUpsideDown: return .portraitUpsideDown
+        case .landscapeLeft: return .landscapeRight   // device and interface axes are mirrored
+        case .landscapeRight: return .landscapeLeft
+        default: return nil
+        }
+    }
+
+    /// The single-orientation mask an interface orientation belongs to, so it can
+    /// be tested against `orientationLock`. Empty for `.unknown`, which no mask
+    /// contains and which nothing should be turned away from.
+    static func mask(for orientation: UIInterfaceOrientation) -> UIInterfaceOrientationMask {
+        switch orientation {
+        case .portrait: return .portrait
+        case .portraitUpsideDown: return .portraitUpsideDown
+        case .landscapeLeft: return .landscapeLeft
+        case .landscapeRight: return .landscapeRight
+        default: return []
+        }
+    }
+
     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? ) -> Bool {
         application.shortcutItems = nil
         UserDefaults.standard.removeObject(forKey: "LCNeedToAcquireJIT")
@@ -31,7 +127,17 @@ import Intents
             LCUtils.appGroupUserDefault.setValue(UIDevice.current.buildVersion, forKey: "LCLastIOSBuildVersion")
         }
         
+        // Carry a pre-slider multitask haptics preference onto the intensity
+        // scale, before Settings can read the new key and find nothing.
+        if #available(iOS 16.0, *) {
+            MultitaskDockManager.migrateHapticsPreferenceIfNeeded()
+        }
+
         return true
+    }
+    
+    func application(_ application: UIApplication, supportedInterfaceOrientationsFor window: UIWindow?) -> UIInterfaceOrientationMask {
+        return Self.orientationLock
     }
     
     func application(_ application: UIApplication, configurationForConnecting connectingSceneSession: UISceneSession, options: UIScene.ConnectionOptions) -> UISceneConfiguration {
@@ -47,6 +153,7 @@ import Intents
             return nil
         }
     }
+    
 }
 
 class SceneDelegate: NSObject, UIWindowSceneDelegate, ObservableObject { // Make SceneDelegate conform ObservableObject
@@ -54,6 +161,27 @@ class SceneDelegate: NSObject, UIWindowSceneDelegate, ObservableObject { // Make
 
     func scene(_ scene: UIScene, willConnectTo session: UISceneSession, options connectionOptions: UIScene.ConnectionOptions) {
         self.window = (scene as? UIWindowScene)?.keyWindow
+        take(connectionOptions.urlContexts)
+    }
+
+    func scene(_ scene: UIScene, openURLContexts URLContexts: Set<UIOpenURLContext>) {
+        take(URLContexts)
+    }
+
+    /// Takes a URL UIKit hands the scene and parks it on the model for whichever
+    /// window is in a state to act on it.
+    ///
+    /// A document opened from the Files app arrives here, and with a scene
+    /// delegate of our own in place SwiftUI's onOpenURL does not reliably see
+    /// it — an IPA opened with the button under a file's preview reached
+    /// nothing at all, no install and no error. Reading it off the delegate
+    /// covers both moments it can arrive: a scene connected for the document,
+    /// and one already on screen.
+    private func take(_ urlContexts: Set<UIOpenURLContext>) {
+        guard let url = urlContexts.first?.url else {
+            return
+        }
+        DataManager.shared.model.pendingOpenURL = url
     }
     
 }
@@ -75,6 +203,65 @@ class SceneDelegate: NSObject, UIWindowSceneDelegate, ObservableObject { // Make
         self.hook_requestSceneSessionActivation(sceneSession, userActivity: userActivity, options: newOptions, errorHandler: errorHandler)
     }
     
+}
+
+/// Manages a passthrough overlay window that shows the iOS beta warning badge
+/// above all app content, including sheets and full-screen covers.
+class BetaOverlayManager {
+    static let shared = BetaOverlayManager()
+    private var overlayWindow: UIWindow?
+
+    func show(on scene: UIWindowScene) {
+        guard overlayWindow == nil else { return }
+
+        let window = PassthroughWindow(windowScene: scene)
+        window.windowLevel = .alert + 1
+        window.backgroundColor = .clear
+        window.isHidden = false
+
+        let hosting = UIHostingController(rootView: BetaBadgeView())
+        hosting.view.backgroundColor = .clear
+        window.rootViewController = hosting
+        overlayWindow = window
+    }
+
+    func hide() {
+        overlayWindow?.isHidden = true
+        overlayWindow = nil
+    }
+}
+
+/// A UIWindow subclass that passes through all touches so the badge
+/// doesn't block interaction with the app underneath.
+private class PassthroughWindow: UIWindow {
+    override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
+        // Return nil so all touches pass through to the window below.
+        return nil
+    }
+}
+
+/// Watermark-style overlay shown in the bottom-right corner, like "Activate Windows".
+private struct BetaBadgeView: View {
+    var body: some View {
+        VStack {
+            Spacer()
+            HStack {
+                Spacer()
+                VStack(alignment: .trailing, spacing: 2) {
+                    Text("iOS Beta Detected")
+                        .font(.system(size: 14, weight: .semibold))
+                    Text("Beta versions of iOS may cause certificate revocation.\nApps and features may not work correctly.\nPlease roll back to the stable release version.")
+                        .font(.system(size: 11))
+                        .multilineTextAlignment(.trailing)
+                }
+                .foregroundStyle(.white.opacity(0.55))
+                .shadow(color: .black.opacity(0.4), radius: 3, x: 0, y: 1)
+                .padding(.trailing, 16)
+                .padding(.bottom, 90)
+            }
+        }
+        .ignoresSafeArea()
+    }
 }
 
 public class ViewAppIntentHandler: NSObject, ViewAppIntentHandling
