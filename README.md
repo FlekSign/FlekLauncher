@@ -5,7 +5,7 @@
 <div align="center">
   <h1>FlekDeck</h1>
   <p><strong>Your apps. Your space. A whole new way to use iOS.</strong></p>
-  <p>Developed by <a href="(https://fleksign.com/)">FlekSign</a></p>
+  <p>Developed by <a href="https://fleksign.com/">FlekSign</a></p>
 </div>
 
 FlekDeck is a powerful app environment designed to feel like a second operating system inside iOS.
